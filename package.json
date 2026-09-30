@@ -1,0 +1,22 @@
+{
+  "name": "codesync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CodeSync — Real-time collaborative code editor with an AI assistant (MERN + Yjs + Monaco).",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace server",
+    "dev:client": "npm run dev --workspace client",
+    "build:server": "npm run build --workspace server",
+    "build:client": "npm run build --workspace client",
+    "typecheck:server": "npm run typecheck --workspace server",
+    "typecheck:client": "npm run typecheck --workspace client",
+    "typecheck": "npm run typecheck:server && npm run typecheck:client",
+    "install:all": "npm install"
+  },
+  "author": "",
+  "license": "MIT"
+}

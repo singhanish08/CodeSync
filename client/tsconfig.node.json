@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    // Referenced (composite) projects may not disable emit; emit declarations
+    // into the tmp dir so nothing clutters the repo.
+    "emitDeclarationOnly": true,
+    "outDir": "node_modules/.tmp"
+  },
+  "include": ["vite.config.ts"]
+}

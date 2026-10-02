@@ -74,13 +74,16 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
   const [awareness, setAwareness] = useState<awarenessProtocol.Awareness | null>(null);
   const [ready, setReady] = useState(false);
 
-  const stateApplied = useRef(false);
   const languageRef = useRef(language);
   languageRef.current = language;
+  // Seeded once per room session. Reset in the effect below when the room
+  // changes; deliberately NOT reset on a reconnect, so clearing the file
+  // doesn't make the welcome snippet reappear after every token refresh.
+  const seeded = useRef(false);
 
   useEffect(() => {
     if (!enabled) return;
-    stateApplied.current = false;
+    seeded.current = false;
     setReady(false);
 
     const localDoc = new Y.Doc();
@@ -93,7 +96,10 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       color: colorForUserId(userId),
     });
 
-    const emitUpdate = (update: Uint8Array) => socket.emit('yjs_update', { update: uint8ToBase64(update) });
+    // Every payload names its room so a stray broadcast from a room we have
+    // already left is filtered instead of merged into this document.
+    const emitUpdate = (update: Uint8Array) =>
+      socket.emit('yjs_update', { roomId, update: uint8ToBase64(update) });
 
     // Local document changes (origin !== 'remote' means we caused them).
     localDoc.on('update', (update: Uint8Array, origin: unknown) => {
@@ -106,15 +112,20 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       const changed = added.concat(updated);
       if (changed.includes(localDoc.clientID)) {
         const encoded = awarenessProtocol.encodeAwarenessUpdate(localAwareness, [localDoc.clientID]);
-        socket.emit('awareness_update', { update: uint8ToBase64(encoded) });
+        socket.emit('awareness_update', { roomId, update: uint8ToBase64(encoded) });
       }
     });
 
     // ── Remote → local ──────────────────────────────────────────────
-    const onRoomState = (payload: { update?: string; presence?: Array<{ userId: string }> }) => {
-      if (stateApplied.current) return;
-      stateApplied.current = true;
 
+    // Sync step 1 reply: the server applied our state vector and sent back
+    // only what we are missing. Applying it is idempotent, so a duplicate
+    // room_state is harmless.
+    const onRoomState = (payload: {
+      update?: string;
+      stateVector?: string;
+      presence?: Array<{ userId: string }>;
+    }) => {
       if (typeof payload?.update === 'string' && payload.update.length) {
         try {
           Y.applyUpdate(localDoc, base64ToUint8(payload.update), 'remote');
@@ -123,10 +134,35 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
         }
       }
 
+      // Sync step 2: send back everything the server is missing from us,
+      // computed against the state vector it just sent. On a clean join this
+      // is nothing; after a reconnect it carries the edits made while
+      // offline — the ones socket.io flushed ahead of join_room and that the
+      // server had to queue, plus any made since. Without this the server
+      // stayed behind us forever and its pendingStructs swallowed every
+      // later edit.
+      if (typeof payload?.stateVector === 'string') {
+        try {
+          const serverVector = Y.decodeStateVector(base64ToUint8(payload.stateVector));
+          const myVector = Y.decodeStateVector(Y.encodeStateVector(localDoc));
+          const serverIsBehind = [...myVector].some(
+            ([client, clock]) => (serverVector.get(client) ?? 0) < clock
+          );
+          if (serverIsBehind) {
+            const missing = Y.encodeStateAsUpdate(localDoc, base64ToUint8(payload.stateVector));
+            socket.emit('sync_step_2', { roomId, update: uint8ToBase64(missing) });
+          }
+        } catch (err) {
+          console.error('[useYjsDoc] Failed to send sync step 2:', err);
+        }
+      }
+
       // Seed a friendly starter only when the room is genuinely empty and we are
       // the only one present — avoids duplicated content when several people
-      // join an empty room at once.
-      if (!localText.toString().trim() && (payload?.presence?.length ?? 0) <= 1) {
+      // join an empty room at once. `seeded` (not a per-reconnect flag) keeps
+      // a cleared file from re-seeding after a reconnect.
+      if (!seeded.current && !localText.toString().trim() && (payload?.presence?.length ?? 0) <= 1) {
+        seeded.current = true;
         localDoc.transact(() => {
           localText.insert(0, starterContent(languageRef.current));
         });
@@ -135,8 +171,9 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       setReady(true);
     };
 
-    const onYjsUpdate = (payload: { update?: string }) => {
-      if (typeof payload?.update !== 'string') return;
+    const onYjsUpdate = (payload: { roomId?: string; update?: string }) => {
+      if (payload?.roomId !== roomId) return; // cross-room leak guard
+      if (typeof payload.update !== 'string') return;
       try {
         Y.applyUpdate(localDoc, base64ToUint8(payload.update), 'remote');
       } catch (err) {
@@ -144,8 +181,9 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       }
     };
 
-    const onAwarenessUpdate = (payload: { update?: string }) => {
-      if (typeof payload?.update !== 'string') return;
+    const onAwarenessUpdate = (payload: { roomId?: string; update?: string }) => {
+      if (payload?.roomId !== roomId) return; // cross-room leak guard
+      if (typeof payload.update !== 'string') return;
       try {
         awarenessProtocol.applyAwarenessUpdate(localAwareness, base64ToUint8(payload.update), 'remote');
       } catch (err) {
@@ -164,13 +202,15 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
     // `socket.to(roomId)` broadcasts reached nobody. Emit on every 'connect'.
     // (socket.io does not replay 'connect' to a listener attached after the
     // fact, so also fire it immediately when the socket is already up.)
+    //
+    // The payload carries our state vector so the server can answer with the
+    // diff we are missing instead of the whole doc (sync step 1).
     const onConnect = () => {
-      // Re-apply the authoritative server snapshot on (re)connect so we cannot
-      // stay subtly behind after a dropped connection. Yjs merges it safely
-      // with any local-only changes.
-      stateApplied.current = false;
       console.info(`[useYjsDoc] socket connected (${socket.id}) — joining room ${roomId}`);
-      socket.emit('join_room', { roomId });
+      socket.emit('join_room', {
+        roomId,
+        stateVector: uint8ToBase64(Y.encodeStateVector(localDoc)),
+      });
     };
     socket.on('connect', onConnect);
     if (socket.connected) onConnect();
@@ -180,6 +220,10 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
     setAwareness(localAwareness);
 
     return () => {
+      // Tell the server we are leaving THIS room so it drops our membership
+      // and stops routing this socket into the old room. Without it, a room
+      // A → B navigation left the socket in A and A's edits leaked into B.
+      socket.emit('leave_room', { roomId });
       socket.off('room_state', onRoomState);
       socket.off('yjs_update', onYjsUpdate);
       socket.off('awareness_update', onAwarenessUpdate);

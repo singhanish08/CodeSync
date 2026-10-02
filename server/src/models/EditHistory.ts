@@ -9,7 +9,10 @@ export interface IEditHistory extends Document {
   userId: Types.ObjectId | null; // null means the AI
   type: EditType;
   summary: string;
-  timestamp: Date;
+  // Mongoose `timestamps: true` maintains createdAt/updatedAt — there is no
+  // `timestamp` field. Referencing one reads `undefined` and crashes callers.
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 const editHistorySchema = new Schema<IEditHistory>(
@@ -23,6 +26,8 @@ const editHistorySchema = new Schema<IEditHistory>(
   { timestamps: true }
 );
 
-editHistorySchema.index({ roomId: 1, timestamp: -1 });
+// Sort by createdAt — the field that actually exists. Indexing `timestamp`
+// built a dead index on a nonexistent field, so the sort could not use it.
+editHistorySchema.index({ roomId: 1, createdAt: -1 });
 
 export const EditHistory = model<IEditHistory>('EditHistory', editHistorySchema);

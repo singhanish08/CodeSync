@@ -3,7 +3,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import mongoose from 'mongoose';
 import { env } from './config/env';
 import { createApp } from './app';
-import { registerSocketHandlers } from './sockets/socketHandlers';
+import { registerSocketHandlers, flushAllRooms } from './sockets/socketHandlers';
 
 const start = async (): Promise<void> => {
   try {
@@ -36,8 +36,18 @@ const start = async (): Promise<void> => {
     console.info(`[server] CodeSync API listening on port ${env.port} (${env.nodeEnv})`);
   });
 
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return; // A second Ctrl-C just forces the exit below.
+    shuttingDown = true;
     console.info(`[server] ${signal} received — shutting down`);
+    try {
+      // Persist every live room BEFORE the transports come down, otherwise
+      // up to PERSIST_INTERVAL_MS of edits is lost on every deploy/restart.
+      await flushAllRooms();
+    } catch (err) {
+      console.error('[server] failed to flush rooms on shutdown:', err);
+    }
     httpServer.close();
     await mongoose.disconnect();
     process.exit(0);

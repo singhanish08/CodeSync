@@ -161,7 +161,7 @@ export const HistoryDrawer = ({
                       </span>
                     )}
                     <span className="ml-auto whitespace-nowrap font-mono text-[10px] text-text-secondary">
-                      {relativeTime(entry.timestamp)}
+                      {relativeTime(entry.createdAt)}
                     </span>
                   </div>
                   <p className="mt-1 text-sm leading-relaxed text-text-secondary">{entry.summary}</p>

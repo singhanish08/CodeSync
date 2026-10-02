@@ -29,7 +29,8 @@ export interface EditHistoryDTO {
   userId: string | null;
   type: EditType;
   summary: string;
-  timestamp: string;
+  // Mongoose `timestamps: true` exposes createdAt, not `timestamp`.
+  createdAt: string;
 }
 
 export type AiMode = 'explain' | 'review' | 'refactor';

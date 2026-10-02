@@ -27,4 +27,8 @@ export const env = {
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5176',
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
+  // The yjs_update hot path logs per keystroke; gate the chatty info logs
+  // behind this so production logs stay readable. On by default in dev, or
+  // explicitly with SOCKET_DEBUG=1.
+  socketDebug: process.env.SOCKET_DEBUG === '1' || process.env.NODE_ENV !== 'production',
 };

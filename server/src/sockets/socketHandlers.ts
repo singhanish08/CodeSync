@@ -12,6 +12,7 @@ import {
   type AiChange,
 } from '../services/groqService';
 import { buildCodeContext } from '../services/treeSitterService';
+import { env } from '../config/env';
 
 // ─────────────────────────────── Types ─────────────────────────────────────
 
@@ -42,6 +43,10 @@ interface RoomState {
 const rooms = new Map<string, RoomState>();
 const PERSIST_INTERVAL_MS = 30_000;
 const HUMAN_EDIT_LOG_THROTTLE_MS = 3_000;
+// Cap how many pre-join updates we hold for one socket. These only exist to
+// close the reconnect ordering race (see yjs_update); the two-step sync
+// recovers anything beyond this, so the bound just guards memory.
+const MAX_QUEUED_UPDATES = 500;
 
 const PALETTE = [
   '#f87171', '#fb923c', '#facc15', '#4ade80', '#34d399',
@@ -83,10 +88,12 @@ const persistRoom = async (roomId: string, state: RoomState): Promise<void> => {
   }
 };
 
-const getOrCreateRoomState = async (roomId: string): Promise<RoomState> => {
-  const existing = rooms.get(roomId);
-  if (existing) return existing;
-
+/**
+ * Builds a fresh RoomState, restoring the persisted snapshot so content
+ * survives server restarts. Callers go through `getOrCreateRoomState`, never
+ * this directly.
+ */
+const createRoomState = async (roomId: string): Promise<RoomState> => {
   const doc = new Y.Doc();
   doc.getText('content'); // ensure the shared text exists
   const awareness = new awarenessProtocol.Awareness(doc);
@@ -100,7 +107,6 @@ const getOrCreateRoomState = async (roomId: string): Promise<RoomState> => {
     lastHumanEditLog: 0,
   };
 
-  // Restore the persisted snapshot so content survives server restarts.
   try {
     const room = await Room.findById(roomId).lean();
     const persisted = yjsStateToUint8(room?.yjsDocState);
@@ -120,17 +126,73 @@ const getOrCreateRoomState = async (roomId: string): Promise<RoomState> => {
   return state;
 };
 
+// In-flight creations, keyed by room. Without single-flight, two concurrent
+// joins that both miss the cache each build a state and the second
+// `rooms.set` orphans the first — along with its saveTimer, which keeps
+// writing a stale doc over Mongo every 30s for the whole process lifetime.
+const pendingRoomState = new Map<string, Promise<RoomState>>();
+
+const getOrCreateRoomState = async (roomId: string): Promise<RoomState> => {
+  const existing = rooms.get(roomId);
+  if (existing) return existing;
+
+  const inFlight = pendingRoomState.get(roomId);
+  if (inFlight) return inFlight;
+
+  const creating = createRoomState(roomId).finally(() => {
+    pendingRoomState.delete(roomId);
+  });
+  pendingRoomState.set(roomId, creating);
+  return creating;
+};
+
+/**
+ * Evicts an empty room, but only once it is STILL empty after the persist
+ * completes. The `await persistRoom` is the race window: a client that joins
+ * in it would come back to a room deleted out from under it, after which
+ * every edit it makes silently hits the "no live state" guard until reload.
+ */
+const evictRoomIfEmpty = async (roomId: string, state: RoomState): Promise<boolean> => {
+  if (state.clients.size !== 0) return false;
+
+  await persistRoom(roomId, state);
+
+  // Re-check AFTER the await — a join during the persist keeps the room alive.
+  if (state.clients.size !== 0) return false;
+
+  // Only clear the timer once we are really evicting; if a client joined
+  // during the persist the room still needs it.
+  if (state.saveTimer) clearInterval(state.saveTimer);
+  rooms.delete(roomId);
+  return true;
+};
+
 const removeClientFromRoom = async (socket: Socket, state: RoomState, roomId: string): Promise<void> => {
   state.clients.delete(socket.id);
   socket.leave(roomId);
 
-  if (state.clients.size === 0) {
-    if (state.saveTimer) clearInterval(state.saveTimer);
-    await persistRoom(roomId, state);
-    rooms.delete(roomId);
-  } else {
+  const evicted = await evictRoomIfEmpty(roomId, state);
+  if (!evicted) {
     socket.to(roomId).emit('presence_update', { users: Array.from(state.clients.values()) });
   }
+};
+
+/**
+ * Persists every live room. Called on shutdown — without it a deploy or
+ * restart discards up to PERSIST_INTERVAL_MS of edits, and the mongoose
+ * disconnect races the process exit.
+ */
+export const flushAllRooms = async (): Promise<void> => {
+  // Snapshot the ids first: a client disconnecting mid-flip can evict a room
+  // under us while we iterate.
+  const ids = [...rooms.keys()];
+  for (const roomId of ids) {
+    const state = rooms.get(roomId);
+    if (!state) continue;
+    if (state.saveTimer) clearInterval(state.saveTimer);
+    await persistRoom(roomId, state);
+  }
+  if (ids.length) console.info(`[socket] persisted ${ids.length} room(s) on shutdown`);
 };
 
 // ───────────────────────── AI suggestion application ───────────────────────
@@ -187,6 +249,40 @@ const logHumanEditThrottled = (roomId: string, state: RoomState, userId: string)
   logEdit(roomId, userId, 'human_edit', 'Edited the shared document');
 };
 
+/**
+ * Applies one encoded update to the room doc and relays it to everyone else.
+ * The payload carries the roomId so a client that is somehow still listening
+ * for the wrong room can filter it rather than apply it to the wrong doc.
+ */
+const applyAndBroadcast = (
+  roomId: string,
+  state: RoomState,
+  updateBase64: string,
+  socket: Socket,
+  userId: string
+): void => {
+  Y.applyUpdate(state.doc, fromBase64(updateBase64), socket);
+  // `socket.to()` excludes the sender, so its own edits are not echoed back.
+  socket.to(roomId).emit('yjs_update', { update: updateBase64, roomId });
+  if (env.socketDebug) {
+    const others = Math.max(0, state.clients.size - 1);
+    console.log(`[server] yjs_update for room ${roomId} from ${socket.id} (${others} other client(s))`);
+  }
+  logHumanEditThrottled(roomId, state, userId);
+};
+
+/**
+ * The authoritative room for an incoming packet is `socket.data.roomId` (a
+ * socket lives in exactly one room in this app). If the packet also names a
+ * room and it disagrees, the packet is a cross-room leak and is rejected.
+ */
+const resolveRoomId = (socket: Socket, payloadRoomId: unknown): string | null => {
+  const current = socket.data.roomId as string | undefined;
+  if (!current) return null;
+  if (typeof payloadRoomId === 'string' && payloadRoomId !== current) return null;
+  return current;
+};
+
 // ───────────────────────────── Auth middleware ─────────────────────────────
 
 export const registerSocketHandlers = (io: Server): void => {
@@ -217,7 +313,7 @@ export const registerSocketHandlers = (io: Server): void => {
     socket.on('join_room', async (payload: unknown) => {
       // First thing, before any logic: this log is the ground truth that a
       // given socket actually attempted to join, and with which room id.
-      const { roomId } = (payload ?? {}) as { roomId?: string };
+      const { roomId, stateVector } = (payload ?? {}) as { roomId?: string; stateVector?: string };
       console.log(`[server] join_room received from socket ${socket.id} for room ${roomId ?? '(missing)'}`);
 
       try {
@@ -226,8 +322,16 @@ export const registerSocketHandlers = (io: Server): void => {
           return;
         }
 
+        // Claim the room BEFORE the first await. socket.io processes packets
+        // in arrival order, so an update queued behind this handler sees a
+        // resolved roomId as soon as we first yield. (Updates that arrived
+        // even earlier — flushed from the client's send buffer ahead of this
+        // join — are queued in the yjs_update handler and flushed below.)
+        socket.data.roomId = roomId;
+
         const room = await Room.findById(roomId).lean();
         if (!room) {
+          delete socket.data.roomId;
           console.warn(`[server] socket ${socket.id} — room ${roomId} not found`);
           socket.emit('error', { message: 'Room not found.' });
           return;
@@ -241,6 +345,7 @@ export const registerSocketHandlers = (io: Server): void => {
           room.members.some((member) => member.toString() === user.id);
 
         if (!alreadyMember) {
+          delete socket.data.roomId;
           console.warn(`[server] socket ${socket.id} denied room ${roomId} — not a member`);
           socket.emit('error', { message: 'You need to join this room first.' });
           return;
@@ -251,15 +356,36 @@ export const registerSocketHandlers = (io: Server): void => {
         // Confirms the Socket.io room membership actually happened — without
         // this, `socket.to(roomId)` broadcasts silently reach nobody.
         console.log(`[server] socket ${socket.id} joined Socket.io room ${roomId}`);
-        socket.data.roomId = roomId;
         state.clients.set(socket.id, {
           userId: user.id,
           displayName: user.displayName,
           color: colorFor(user.id),
         });
 
+        // Replays any updates that beat this join — socket.io flushes the
+        // client's send buffer (offline edits) before replaying our
+        // 'connect' handler, so they can land ahead of join_room. Applying
+        // them now means the diff below is computed against a current doc.
+        const queued = (socket.data.pendingUpdates as string[] | undefined) ?? [];
+        socket.data.pendingUpdates = [];
+        for (const update of queued) {
+          applyAndBroadcast(roomId, state, update, socket, user.id);
+        }
+
+        // Sync step 1 reply. Instead of sending the whole doc, send only
+        // what THIS client is missing, computed against the state vector it
+        // just handed us. Falls back to the full doc for a client that
+        // sends no vector.
+        const clientSV = typeof stateVector === 'string' && stateVector.length ? fromBase64(stateVector) : null;
+        const reply = clientSV ? Y.encodeStateAsUpdate(state.doc, clientSV) : Y.encodeStateAsUpdate(state.doc);
+
+        // Ship our own state vector too — sync step 2 request — so the
+        // client can send back whatever we are missing from it. That is what
+        // recovers edits made while offline: without it, a clock gap left
+        // the server's follow-up updates parked in pendingStructs forever.
         socket.emit('room_state', {
-          update: toBase64(Y.encodeStateAsUpdate(state.doc)),
+          update: toBase64(reply),
+          stateVector: toBase64(Y.encodeStateVector(state.doc)),
           presence: Array.from(state.clients.values()),
         });
         io.to(roomId).emit('presence_update', { users: Array.from(state.clients.values()) });
@@ -272,39 +398,101 @@ export const registerSocketHandlers = (io: Server): void => {
     // ─────────────────────────── yjs_update ────────────────────────────
     socket.on('yjs_update', (payload: unknown) => {
       try {
-        const roomId = socket.data.roomId as string | undefined;
-        const { update } = (payload ?? {}) as { update?: string };
-        if (!roomId || typeof update !== 'string') return;
+        const { update, roomId: payloadRoomId } = (payload ?? {}) as { update?: string; roomId?: string };
+        if (typeof update !== 'string') return;
 
-        const state = rooms.get(roomId);
-        if (!state) {
-          console.warn(`[server] yjs_update from socket ${socket.id} — room ${roomId} has no live state`);
+        const roomId = resolveRoomId(socket, payloadRoomId);
+        if (!roomId) {
+          // Reconnect race: socket.io flushes the client's send buffer
+          // (edits made while offline) BEFORE replaying its 'connect'
+          // handler, so this update can beat its own join_room. Hold it
+          // until the join completes instead of dropping it forever — the
+          // two-step sync then reconciles anything this misses.
+          const hasJoined = Boolean(socket.data.roomId);
+          if (!hasJoined) {
+            const queue = (socket.data.pendingUpdates as string[] | undefined) ?? [];
+            if (queue.length < MAX_QUEUED_UPDATES) {
+              queue.push(update);
+              socket.data.pendingUpdates = queue;
+            } else if (env.socketDebug) {
+              console.warn(`[server] socket ${socket.id} overflowed its pre-join update queue`);
+            }
+          }
           return;
         }
 
-        console.log(`[server] yjs_update received from socket ${socket.id} for room ${roomId}`);
-        Y.applyUpdate(state.doc, fromBase64(update), socket);
-        socket.to(roomId).emit('yjs_update', { update });
-        const others = Math.max(0, state.clients.size - 1);
-        console.log(`[server] broadcast yjs_update to room ${roomId} (${others} other client(s))`);
-        logHumanEditThrottled(roomId, state, user.id);
+        const state = rooms.get(roomId);
+        if (!state) {
+          if (env.socketDebug) {
+            console.warn(`[server] yjs_update from socket ${socket.id} — room ${roomId} has no live state`);
+          }
+          return;
+        }
+
+        applyAndBroadcast(roomId, state, update, socket, user.id);
       } catch (err) {
         console.error('[socket] yjs_update failed:', err);
       }
     });
 
+    // ─────────────────────────── sync_step_2 ───────────────────────────
+    // The client's reply to the state vector we sent in room_state: everything
+    // the server is missing from it. On a clean join this is empty; after a
+    // reconnect it carries the offline edits — including any that arrived
+    // before join_room and had to be queued, and any the client made while
+    // we were computing the diff.
+    socket.on('sync_step_2', (payload: unknown) => {
+      try {
+        const { update, roomId: payloadRoomId } = (payload ?? {}) as { update?: string; roomId?: string };
+        if (typeof update !== 'string') return;
+
+        const roomId = resolveRoomId(socket, payloadRoomId);
+        if (!roomId) return;
+
+        const state = rooms.get(roomId);
+        if (!state) {
+          if (env.socketDebug) {
+            console.warn(`[server] sync_step_2 from socket ${socket.id} — room ${roomId} has no live state`);
+          }
+          return;
+        }
+
+        applyAndBroadcast(roomId, state, update, socket, user.id);
+      } catch (err) {
+        console.error('[socket] sync_step_2 failed:', err);
+      }
+    });
+
+    // ───────────────────────── leave_room ──────────────────────────────
+    // Navigating room A → B reuses one socket. Without an explicit leave the
+    // socket stays in Socket.io room A, and A's broadcasts (which carry no
+    // room context the client could trust) were applied into B's document.
+    socket.on('leave_room', async (payload: unknown) => {
+      const { roomId } = (payload ?? {}) as { roomId?: string };
+      if (!roomId || typeof roomId !== 'string') return;
+      if (socket.data.roomId !== roomId) return; // not in this room
+
+      const state = rooms.get(roomId);
+      if (state) await removeClientFromRoom(socket, state, roomId);
+      delete socket.data.roomId;
+
+      if (env.socketDebug) console.log(`[server] socket ${socket.id} left room ${roomId}`);
+    });
+
     // ──────────────────────── awareness_update ────────────────────────
     socket.on('awareness_update', (payload: unknown) => {
       try {
-        const roomId = socket.data.roomId as string | undefined;
-        const { update } = (payload ?? {}) as { update?: string };
-        if (!roomId || typeof update !== 'string') return;
+        const { update, roomId: payloadRoomId } = (payload ?? {}) as { update?: string; roomId?: string };
+        if (typeof update !== 'string') return;
+
+        const roomId = resolveRoomId(socket, payloadRoomId);
+        if (!roomId) return;
 
         const state = rooms.get(roomId);
         if (!state) return;
 
         awarenessProtocol.applyAwarenessUpdate(state.awareness, fromBase64(update), socket);
-        socket.to(roomId).emit('awareness_update', { update });
+        socket.to(roomId).emit('awareness_update', { update, roomId });
       } catch (err) {
         console.error('[socket] awareness_update failed:', err);
       }
@@ -403,7 +591,7 @@ export const registerSocketHandlers = (io: Server): void => {
         state.pendingSuggestions.delete(suggestionId);
 
         const update = Y.encodeStateAsUpdate(state.doc);
-        io.to(roomId).emit('yjs_update', { update: toBase64(update) });
+        io.to(roomId).emit('yjs_update', { update: toBase64(update), roomId });
         io.to(roomId).emit('ai_suggestion_accepted', { suggestionId });
 
         logEdit(roomId, user.id, 'ai_accepted', 'Accepted an AI refactor suggestion');
@@ -443,6 +631,8 @@ export const registerSocketHandlers = (io: Server): void => {
         const state = rooms.get(roomId);
         if (state) await removeClientFromRoom(socket, state, roomId);
       }
+      // Nothing is joining this socket anymore; drop any unreplayed queue.
+      socket.data.pendingUpdates = [];
     });
   });
 };

@@ -227,7 +227,7 @@ export const RoomEditor = () => {
             <button
               type="button"
               onClick={retry}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-text-on-accent transition-opacity hover:opacity-90"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90"
             >
               <RotateCw size={14} /> Retry connection
             </button>

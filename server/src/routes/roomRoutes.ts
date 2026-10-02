@@ -197,7 +197,7 @@ router.get(
     if (!isMember(room, req.user!.id)) throw new ApiError(403, 'You need to join this room first.');
 
     const history = await EditHistory.find({ roomId: room._id })
-      .sort({ timestamp: -1 })
+      .sort({ createdAt: -1 })
       .limit(100)
       .lean();
 
@@ -208,7 +208,7 @@ router.get(
         userId: h.userId ? h.userId.toString() : null,
         type: h.type,
         summary: h.summary,
-        timestamp: h.timestamp.toISOString(),
+        createdAt: h.createdAt.toISOString(),
       })),
     });
   })

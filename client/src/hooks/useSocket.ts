@@ -53,8 +53,13 @@ export const useSocket = (autoConnect = true): UseSocketResult => {
       if (authFailure) void refreshAndReconnect();
       // Socket.io keeps retrying on its own; only surface an error state if we
       // have never connected, so an established session isn't flagged red by a
-      // transient drop.
-      setStatus((prev) => (prev === 'connected' ? prev : 'error'));
+      // transient drop. If we HAD connected, mark it disconnected — socket.io
+      // is already reconnecting and the pill should reflect reality rather
+      // than a stale "connected" while every edit is silently buffered.
+      setStatus((prev) => {
+        if (prev === 'connected') return 'disconnected';
+        return prev === 'connecting' ? 'error' : prev;
+      });
       setErrorReason(err.message);
     };
 

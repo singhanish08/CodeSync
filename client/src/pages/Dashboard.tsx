@@ -16,7 +16,9 @@ import { Skeleton } from '../components/ui/Skeleton';
 import { useToast } from '../components/ui/Toast';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { Kbd } from '../components/ui/Kbd';
+import { LanguageSelect } from '../components/room/LanguageSelect';
 import { colorForUserId, initials } from '../lib/utils';
+import { DEFAULT_LANGUAGE } from '../lib/languages';
 
 /** Deterministic faux-code thumbnail so every room card has a visual. */
 const thumbnailFor = (room: RoomDTO) => {
@@ -57,6 +59,7 @@ export const Dashboard = () => {
   const [newRoomName, setNewRoomName] = useState('');
   const [newRoomPublic, setNewRoomPublic] = useState(true);
   const [newRoomPassword, setNewRoomPassword] = useState('');
+  const [newRoomLanguage, setNewRoomLanguage] = useState(DEFAULT_LANGUAGE);
   const [formError, setFormError] = useState('');
   const [query, setQuery] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
@@ -127,12 +130,14 @@ export const Dashboard = () => {
       const response = await api.post('/rooms', {
         name: newRoomName.trim(),
         isPublic: newRoomPublic,
+        language: newRoomLanguage,
         // Ignored by the server for public rooms; required for private ones.
         password: newRoomPublic ? undefined : newRoomPassword,
       });
       setShowCreateForm(false);
       setNewRoomName('');
       setNewRoomPassword('');
+      setNewRoomLanguage(DEFAULT_LANGUAGE);
       // Surface the Room ID front and centre — there is no link to copy, the
       // Room ID (+ password for a private room) is how collaborators get in.
       setCreatedRoom(response.data.room);
@@ -605,6 +610,19 @@ export const Dashboard = () => {
               autoComplete="new-password"
             />
           )}
+          <div>
+            <p className="mb-2 text-sm font-medium text-text-primary">Language</p>
+            <LanguageSelect
+              language={newRoomLanguage}
+              onLanguageChange={setNewRoomLanguage}
+              align="down"
+              aria-label="Room language"
+              triggerClassName="border border-border bg-bg-secondary px-2.5 py-2 text-sm w-full justify-between rounded-control"
+            />
+            <p className="mt-2 text-xs text-text-secondary">
+              Empty rooms open with a short hello snippet in this language.
+            </p>
+          </div>
           <div className="flex gap-2">
             <Button
               type="button"

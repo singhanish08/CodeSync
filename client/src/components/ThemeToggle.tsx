@@ -4,6 +4,7 @@ import { useTheme } from '../contexts/ThemeContext';
 import type { AppTheme } from '../types';
 import { cn } from '../lib/utils';
 import { THEME_LABELS } from '../lib/utils';
+import { Tooltip } from './ui/Tooltip';
 
 const OPTIONS: Array<{ value: AppTheme; icon: typeof Sun; label: string }> = [
   { value: 'light', icon: Sun, label: 'Light' },
@@ -42,19 +43,20 @@ export const ThemeToggle = ({ compact = false, className }: ThemeToggleProps) =>
     const CurrentIcon = OPTIONS.find((option) => option.value === theme)?.icon ?? Moon;
     const next: AppTheme = theme === 'light' ? 'dark' : theme === 'dark' ? 'eyeshield' : 'light';
     return (
-      <button
-        ref={containerRef as never}
-        type="button"
-        onClick={(event) => switchTo(next, event)}
-        className={cn(
-          'inline-flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-bg-secondary text-text-primary transition-colors hover:opacity-80',
-          className
-        )}
-        title={`Theme: ${THEME_LABELS[theme]} (click to switch to ${THEME_LABELS[next]})`}
-        aria-label={`Switch theme (currently ${theme})`}
-      >
-        <CurrentIcon size={18} />
-      </button>
+      <Tooltip content={THEME_LABELS[theme]} side="bottom">
+        <button
+          ref={containerRef as never}
+          type="button"
+          onClick={(event) => switchTo(next, event)}
+          className={cn(
+            'inline-flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-bg-secondary text-text-primary transition-colors hover:opacity-80',
+            className
+          )}
+          aria-label={`Switch theme (currently ${theme}, click for ${next})`}
+        >
+          <CurrentIcon size={18} />
+        </button>
+      </Tooltip>
     );
   }
 
@@ -79,20 +81,20 @@ export const ThemeToggle = ({ compact = false, className }: ThemeToggleProps) =>
         }}
       />
       {OPTIONS.map(({ value, icon: Icon, label }) => (
-        <button
-          key={value}
-          type="button"
-          onClick={(event) => switchTo(value, event)}
-          title={label}
-          aria-label={label}
-          aria-pressed={theme === value}
-          className={cn(
-            'relative z-10 inline-flex h-8 w-8 items-center justify-center rounded-md transition-colors duration-200',
-            theme === value ? 'text-accent-foreground' : 'text-text-secondary hover:text-text-primary'
-          )}
-        >
-          <Icon size={16} />
-        </button>
+        <Tooltip key={value} content={label} side="bottom">
+          <button
+            type="button"
+            onClick={(event) => switchTo(value, event)}
+            aria-label={label}
+            aria-pressed={theme === value}
+            className={cn(
+              'relative z-10 inline-flex h-8 w-8 items-center justify-center rounded-md transition-colors duration-200',
+              theme === value ? 'text-accent-foreground' : 'text-text-secondary hover:text-text-primary'
+            )}
+          >
+            <Icon size={16} />
+          </button>
+        </Tooltip>
       ))}
     </div>
   );

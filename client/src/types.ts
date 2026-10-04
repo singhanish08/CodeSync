@@ -12,6 +12,7 @@ export interface RoomDTO {
   ownerId: string;
   isPublic: boolean;
   members: string[];
+  language: string;
   createdAt: string;
   updatedAt: string;
 }

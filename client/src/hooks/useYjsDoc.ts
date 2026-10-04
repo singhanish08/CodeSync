@@ -3,6 +3,7 @@ import * as Y from 'yjs';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import type { Socket } from 'socket.io-client';
 import { base64ToUint8, uint8ToBase64, colorForUserId } from '../lib/utils';
+import { starterContent } from '../lib/starterContent';
 
 interface UseYjsDocArgs {
   roomId: string;
@@ -24,41 +25,6 @@ interface UseYjsDocResult {
   ready: boolean;
 }
 
-const starterContent = (language: string): string => {
-  switch (language) {
-    case 'python':
-    case 'ruby':
-      return '# Welcome to CodeSync 👋\n# Everyone in this room edits the same document in real time.\n# Select code and hit "Explain" or "Review" in the AI panel.\n\n\ndef greet(name):\n    return f"Hello, {name}!"\n\n\nprint(greet("world"))\n';
-    case 'typescript':
-    case 'typescriptreact':
-      return '// Welcome to CodeSync 👋\n// Everyone in this room edits the same document in real time.\n// Select code and hit "Explain" or "Review" in the AI panel.\n\nfunction greet(name: string): string {\n  return `Hello, ${name}!`;\n}\n\nconsole.log(greet("world"));\n';
-    case 'bash':
-      return '# Welcome to CodeSync 👋\n# Everyone in this room edits the same document in real time.\n# Select code and hit "Explain" or "Review" in the AI panel.\n\ngreet() {\n  echo "Hello, $1!"\n}\n\ngreet "world"\n';
-    case 'sql':
-      return '-- Welcome to CodeSync 👋\n-- Everyone in this room edits the same document in real time.\n\nSELECT \'Hello, world!\' AS greeting;\n';
-    case 'html':
-      return '<!-- Welcome to CodeSync 👋 -->\n<!-- Everyone in this room edits the same document in real time. -->\n\n<!DOCTYPE html>\n<html>\n  <body>\n    <h1>Hello, world!</h1>\n  </body>\n</html>\n';
-    case 'css':
-      return '/* Welcome to CodeSync 👋 */\n/* Everyone in this room edits the same document in real time. */\n\n.greeting {\n  content: "Hello, world!";\n}\n';
-    case 'markdown':
-      return '# Welcome to CodeSync 👋\n\nEveryone in this room edits the same document in real time.\n\n> Select code and hit **Explain** or **Review** in the AI panel.\n';
-    case 'json':
-      return '{\n  "welcome": "CodeSync 👋",\n  "note": "Everyone in this room edits the same document in real time."\n}\n';
-    case 'java':
-    case 'kotlin':
-    case 'csharp':
-    case 'scala':
-      return '// Welcome to CodeSync 👋\n// Everyone in this room edits the same document in real time.\n\npublic class Main {\n  public static void main(String[] args) {\n    System.out.println("Hello, world!");\n  }\n}\n';
-    case 'go':
-      return '// Welcome to CodeSync 👋\n// Everyone in this room edits the same document in real time.\n\npackage main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("Hello, world!")\n}\n';
-    case 'rust':
-    case 'c':
-    case 'cpp':
-      return '// Welcome to CodeSync 👋\n// Everyone in this room edits the same document in real time.\n\n#include <iostream>\n\nint main() {\n  std::cout << "Hello, world!" << std::endl;\n  return 0;\n}\n';
-    default:
-      return '// Welcome to CodeSync 👋\n// Everyone in this room edits the same document in real time.\n// Select code and hit "Explain" or "Review" in the AI panel.\n\nfunction greet(name) {\n  return `Hello, ${name}!`;\n}\n\nconsole.log(greet("world"));\n';
-  }
-};
 
 /**
  * Wires a local Y.Doc to the server over the shared Socket.io connection:

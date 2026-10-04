@@ -9,6 +9,19 @@ import { AuthedRequest, requireAuth } from '../middleware/requireAuth';
 
 const router = Router();
 
+/** Languages a room can be seeded in. Mirrors the editor's language dropdown. */
+const SUPPORTED_LANGUAGES = [
+  'javascript', 'typescript', 'python', 'cpp', 'java', 'go', 'rust', 'c',
+  'ruby', 'php', 'json', 'html', 'css', 'markdown', 'bash',
+] as const;
+
+const DEFAULT_LANGUAGE = 'javascript';
+
+const normalizeLanguage = (value: unknown): string => {
+  const lang = String(value ?? '').toLowerCase();
+  return (SUPPORTED_LANGUAGES as readonly string[]).includes(lang) ? lang : DEFAULT_LANGUAGE;
+};
+
 // Every room route requires a valid access token.
 router.use(requireAuth);
 
@@ -31,6 +44,7 @@ type AnyRoom = {
   ownerId: { toString(): string };
   isPublic: boolean;
   members: Array<{ toString(): string }>;
+  language?: string;
   createdAt: { toISOString(): string } | Date;
   updatedAt: { toISOString(): string } | Date;
 };
@@ -41,6 +55,7 @@ const toRoomDTO = (room: AnyRoom) => ({
   ownerId: room.ownerId.toString(),
   isPublic: room.isPublic,
   members: room.members.map((member) => member.toString()),
+  language: normalizeLanguage(room.language),
   createdAt: new Date(room.createdAt as unknown as string).toISOString(),
   updatedAt: new Date(room.updatedAt as unknown as string).toISOString(),
 });
@@ -72,6 +87,7 @@ router.post(
     if (name.length > 80) throw new ApiError(400, 'Room name must be 80 characters or fewer.');
 
     const isPublic = Boolean(req.body?.isPublic ?? true);
+    const language = normalizeLanguage(req.body?.language);
     const ownerId = new Types.ObjectId(req.user!.id);
 
     // A private room needs a password to join manually; public rooms never do.
@@ -87,6 +103,7 @@ router.post(
       ownerId,
       isPublic,
       passwordHash,
+      language,
       members: [ownerId],
     });
 
@@ -105,6 +122,25 @@ router.get(
     const room = await Room.findById(req.params.id).lean();
     if (!room) throw new ApiError(404, 'Room not found.');
     if (!isMember(room, req.user!.id)) throw new ApiError(403, 'You need to join this room first.');
+
+    res.json({ room: toRoomDTO(room) });
+  })
+);
+
+/**
+ * Update a room's language. Any member can switch it — the in-editor language
+ * selector is available to everyone in the room. Only `language` is mutable
+ * through this route.
+ */
+router.patch(
+  '/:id',
+  asyncHandler(async (req: AuthedRequest, res: Response) => {
+    const room = await Room.findById(req.params.id);
+    if (!room) throw new ApiError(404, 'Room not found.');
+    if (!isMember(room, req.user!.id)) throw new ApiError(403, 'You need to join this room first.');
+
+    room.language = normalizeLanguage(req.body?.language);
+    await room.save();
 
     res.json({ room: toRoomDTO(room) });
   })

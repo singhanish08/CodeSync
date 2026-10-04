@@ -388,6 +388,18 @@ export const registerSocketHandlers = (io: Server): void => {
           stateVector: toBase64(Y.encodeStateVector(state.doc)),
           presence: Array.from(state.clients.values()),
         });
+
+        // Replay every collaborator's current awareness to the newcomer.
+        // Awareness is only broadcast on change, so without this a fresh join
+        // would show no remote cursors until someone else happened to move.
+        const awarenessClients = Array.from(state.awareness.getStates().keys());
+        if (awarenessClients.length > 0) {
+          socket.emit('awareness_update', {
+            update: toBase64(awarenessProtocol.encodeAwarenessUpdate(state.awareness, awarenessClients)),
+            roomId,
+          });
+        }
+
         io.to(roomId).emit('presence_update', { users: Array.from(state.clients.values()) });
       } catch (err) {
         console.error('[socket] join_room failed:', err);

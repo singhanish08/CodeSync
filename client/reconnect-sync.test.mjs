@@ -21,7 +21,7 @@
 import { io } from 'socket.io-client';
 import * as Y from 'yjs';
 
-const HOST = 'http://127.0.0.1:5175';
+const HOST = process.env.CODESYNC_HOST || 'http://127.0.0.1:5175';
 const API = `${HOST}/api`;
 
 const api = async (path, { method = 'POST', body, token } = {}) => {

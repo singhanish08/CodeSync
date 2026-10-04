@@ -93,6 +93,11 @@ export const RoomEditor = () => {
         const response = await api.get(`/rooms/${roomId}`);
         if (!cancelled) {
           setRoom(response.data.room);
+          // Seed the language from the room BEFORE the socket join fires, so
+          // the starter snippet matches. Batched with setRoom, so the join
+          // effect (gated on `room`) reads the updated value in the same
+          // render cycle.
+          setLanguage(response.data.room?.language ?? 'javascript');
           setRoomError('');
         }
       } catch (err) {
@@ -160,7 +165,23 @@ export const RoomEditor = () => {
     return text || undefined;
   }, []);
 
-  const handleLanguageChange = (next: string) => setLanguage(next);
+  const handleLanguageChange = useCallback(
+    (next: string) => {
+      const previous = language;
+      if (next === previous) return;
+      // Switch locally right away; persist in the background so the room keeps
+      // this language on the next visit. A failure rolls the selector back.
+      setLanguage(next);
+      if (!roomId) return;
+      void api
+        .patch(`/rooms/${roomId}`, { language: next })
+        .catch((err: unknown) => {
+          setLanguage(previous);
+          toast({ title: 'Could not change the room language.', description: extractApiError(err), variant: 'error' });
+        });
+    },
+    [language, roomId, toast]
+  );
 
   // Re-layout the editor when returning to it on mobile (it was display:none).
   useEffect(() => {

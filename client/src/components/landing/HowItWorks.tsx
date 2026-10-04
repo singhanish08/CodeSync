@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { motion, useMotionValueEvent, useScroll, useTransform } from 'framer-motion';
+import { motion, AnimatePresence, useMotionValueEvent, useScroll, useTransform } from 'framer-motion';
 import { DoorOpen, UserPlus, Edit, Sparkles, Check } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
@@ -185,15 +185,21 @@ const STEPS: Step[] = [
 ];
 
 /**
- * Section D — sticky-scroll storytelling. The left column pins the step list
- * while the right swaps illustrations as you scroll. A progress rail glows.
- * On mobile it collapses to a simple vertical timeline.
+ * Section D — sticky-scroll storytelling. The step list scrolls past a focus
+ * line on the left while the illustration pins itself to the viewport on the
+ * right and swaps to whichever step the focus line is on. A progress rail
+ * glows. On mobile it collapses to a simple vertical timeline.
  */
 export const HowItWorks = () => {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Progress must span the whole time the step list is passing the focus line.
+  // A narrow range here used to clamp at 1 almost immediately, so
+  // `useMotionValueEvent` stopped firing and the illustration froze after
+  // step 1. 'start end' → 'end start' keeps it changing across the full
+  // traversal of the section through the viewport.
   const { scrollYProgress } = useScroll({
     target: containerRef,
-    offset: ['start 20%', 'end 70%'],
+    offset: ['start end', 'end start'],
   });
   const railScaleY = useTransform(scrollYProgress, [0, 1], [0, 1]);
 
@@ -233,8 +239,8 @@ export const HowItWorks = () => {
       </div>
 
       <div ref={containerRef} className="relative grid gap-10 lg:grid-cols-[1fr_1.1fr]">
-        {/* Sticky step list */}
-        <div className="lg:sticky lg:top-24 lg:h-fit">
+        {/* Scrolling step list — each step passes the focus line in turn */}
+        <div>
           <div className="relative pl-8">
             {/* Progress rail */}
             <div className="absolute left-0 top-2 bottom-2 w-px bg-border" aria-hidden>
@@ -278,28 +284,27 @@ export const HowItWorks = () => {
           </div>
         </div>
 
-        {/* Swapping illustration */}
-        <div className="relative h-[280px] sm:h-[340px]">
-          {STEPS.map((step, index) => (
-            <motion.div
-              key={step.title}
-              className={cn(
-                'absolute inset-0 flex items-center justify-center rounded-panel border border-border bg-bg-secondary p-6 gradient-border',
-                index === activeStep ? 'pointer-events-auto' : 'pointer-events-none'
-              )}
-              animate={{
-                opacity: index === activeStep ? 1 : 0,
-                y: index === activeStep ? 0 : 12,
-                scale: index === activeStep ? 1 : 0.97,
-              }}
-              transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-            >
-              <div className="h-full w-full">{step.art}</div>
-              <span className="absolute bottom-4 right-5 font-mono text-[10px] text-text-secondary">
-                {String(index + 1).padStart(2, '0')} / {String(STEPS.length).padStart(2, '0')}
-              </span>
-            </motion.div>
-          ))}
+        {/* Pinned illustration — swaps as the step list scrolls past the line */}
+        <div className="lg:sticky lg:top-24 lg:self-start">
+          <div className="relative h-[280px] sm:h-[340px]">
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={activeStep}
+                className="absolute inset-0 flex items-center justify-center rounded-panel border border-border bg-bg-secondary p-6 gradient-border"
+                initial={{ opacity: 0, y: 12, scale: 0.97 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -12, scale: 0.97 }}
+                transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+              >
+                {/* Keyed on activeStep so the freshly-mounted art replays its
+                    own draw-in animation instead of sitting at its end state. */}
+                <div className="h-full w-full">{STEPS[activeStep].art}</div>
+                <span className="absolute bottom-4 right-5 font-mono text-[10px] text-text-secondary">
+                  {String(activeStep + 1).padStart(2, '0')} / {String(STEPS.length).padStart(2, '0')}
+                </span>
+              </motion.div>
+            </AnimatePresence>
+          </div>
         </div>
       </div>
     </section>

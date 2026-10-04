@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence, useScroll, useSpring } from 'framer-motion';
-import { Menu, X, Command } from 'lucide-react';
+import { Menu, X } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { ThemeToggle } from '../ThemeToggle';
 import { Button } from '../ui/Button';
@@ -22,7 +22,7 @@ interface NavbarProps {
 
 /**
  * Sticky glass navbar. Shows the scroll-progress bar under itself, the theme
- * toggle, a ⌘K hint, and auth-aware CTAs. Mobile gets a full-screen menu.
+ * toggle, a ⌘K hint chip, and auth-aware CTAs. Mobile gets a full-screen menu.
  */
 export const Navbar = ({ onOpenPalette }: NavbarProps) => {
   const { user, logout } = useAuth();
@@ -89,10 +89,9 @@ export const Navbar = ({ onOpenPalette }: NavbarProps) => {
             <button
               type="button"
               onClick={onOpenPalette}
-              className="hidden h-9 items-center gap-2 rounded-lg border border-border bg-bg-secondary pl-3 pr-2 text-sm text-text-secondary transition-colors hover:text-text-primary sm:inline-flex"
+              className="hidden h-9 items-center rounded-lg border border-border bg-bg-secondary px-2 text-sm text-text-secondary transition-colors hover:text-text-primary sm:inline-flex"
               aria-label="Open command palette"
             >
-              <Command size={14} />
               <Kbd>⌘K</Kbd>
             </button>
             <ThemeToggle />

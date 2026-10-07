@@ -91,6 +91,7 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       update?: string;
       stateVector?: string;
       presence?: Array<{ userId: string }>;
+      language?: string;
     }) => {
       if (typeof payload?.update === 'string' && payload.update.length) {
         try {
@@ -129,8 +130,15 @@ export const useYjsDoc = ({ roomId, userId, displayName, socket, language, enabl
       // a cleared file from re-seeding after a reconnect.
       if (!seeded.current && !localText.toString().trim() && (payload?.presence?.length ?? 0) <= 1) {
         seeded.current = true;
+        // The server ships the room's own language with this payload, so the
+        // snippet matches the status bar even if our REST fetch for the room
+        // metadata has not landed yet. Fall back to the prop for the case
+        // where an older server omits the field.
+        const seedLanguage = typeof payload?.language === 'string' && payload.language
+          ? payload.language
+          : languageRef.current;
         localDoc.transact(() => {
-          localText.insert(0, starterContent(languageRef.current));
+          localText.insert(0, starterContent(seedLanguage));
         });
       }
 

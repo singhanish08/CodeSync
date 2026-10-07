@@ -9,6 +9,8 @@ import { api, extractApiError } from '../lib/api';
 import type { AppTheme, PresenceUser, RoomDTO } from '../types';
 import { useSocket } from '../hooks/useSocket';
 import { useYjsDoc } from '../hooks/useYjsDoc';
+import { classifyStarter } from '../lib/starterContent';
+import { languageLabel } from '../lib/languages';
 import { CodeEditor } from '../components/editor/CodeEditor';
 import { AIPanel } from '../components/ai/AIPanel';
 import { PresenceBar } from '../components/room/PresenceBar';
@@ -17,6 +19,7 @@ import { StatusBar } from '../components/room/StatusBar';
 import { ShareButton } from '../components/room/ShareButton';
 import { ConnectionPill } from '../components/room/ConnectionPill';
 import { HistoryDrawer } from '../components/room/HistoryDrawer';
+import { SnippetSwapDialog } from '../components/room/SnippetSwapDialog';
 import { WakingUpServer } from '../components/room/WakingUpServer';
 import { ThemeToggle } from '../components/ThemeToggle';
 import { Avatar } from '../components/ui/Avatar';
@@ -66,6 +69,9 @@ export const RoomEditor = () => {
   const [roomError, setRoomError] = useState('');
   const [presence, setPresence] = useState<PresenceUser[]>([]);
   const [language, setLanguage] = useState('javascript');
+  // A language switch waiting on the user's answer to "still the sample, but
+  // edited — rewrite it?". Null until the ambiguity dialog is open.
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<MobileView>('editor');
   const [cursor, setCursor] = useState<{ line: number; column: number } | null>(null);
   const [aiOpen, setAiOpen] = useState<boolean>(() => {
@@ -80,6 +86,23 @@ export const RoomEditor = () => {
   useEffect(() => {
     window.localStorage.setItem(AI_OPEN_KEY, String(aiOpen));
   }, [aiOpen]);
+
+  // Drop everything that belongs to the room we just left. Navigating from one
+  // room to another reuses this component, so without a reset the old room's
+  // language, presence, and metadata hang around while the new one loads —
+  // Monaco would highlight the new document with the old room's mode, and a
+  // stale language could be offered to a switch in a room it does not belong
+  // to. Runs before the fetch below, whose async result overwrites it.
+  useEffect(() => {
+    setRoom(null);
+    setRoomError('');
+    setPresence([]);
+    setLanguage('javascript');
+    setPendingSwitch(null);
+    setHistoryOpen(false);
+    setIsEditingName(false);
+    setNameDraft('');
+  }, [roomId]);
 
   // Fetch room metadata. This is the access gate: a 403 means the caller is
   // not the owner and has not joined the room yet. There is no link-based way
@@ -141,6 +164,50 @@ export const RoomEditor = () => {
     };
   }, [socket]);
 
+  // Another member switched the room's language (or the server corrected the
+  // one we asked for). The swapped starter snippet arrives separately as a Yjs
+  // update; this retargets Monaco's language mode so the highlight follows the
+  // content. Without it a remote collaborator keeps highlighting the new
+  // snippet with the OLD language after someone else switches.
+  useEffect(() => {
+    const onLanguageChanged = (payload: { roomId?: string; language?: string; snippetReplaced?: boolean }) => {
+      if (!payload || payload.roomId !== roomId) return; // cross-room leak guard
+      const next = payload.language;
+      if (typeof next !== 'string') return;
+      setLanguage((current) => (current === next ? current : next));
+      // The server rewrote the welcome sample for everyone. The new text lands
+      // as a Yjs update a moment later — this just says out loud that the
+      // rewrite was intentional rather than something the editor mangled.
+      if (payload.snippetReplaced) {
+        toast({
+          title: 'Welcome sample updated',
+          description: `This room's example code was rewritten in ${languageLabel(next)}.`,
+          variant: 'info',
+        });
+      }
+    };
+    socket.on('language_changed', onLanguageChanged);
+    return () => {
+      socket.off('language_changed', onLanguageChanged);
+    };
+  }, [socket, roomId, toast]);
+
+  // An admin closed or deleted the room out from under this session. Without a
+  // listener the editor would just silently go dark (socket torn down by the
+  // server) and every later edit would fail; instead explain it once and route
+  // the user somewhere that still exists.
+  useEffect(() => {
+    const onRoomClosed = (payload: { roomId?: string; reason?: string }) => {
+      if (!payload || (payload.roomId && payload.roomId !== roomId)) return;
+      toast({ title: 'Room closed', description: payload.reason ?? 'This room was closed by an admin.', variant: 'info' });
+      navigate('/dashboard', { replace: true });
+    };
+    socket.on('room_closed', onRoomClosed);
+    return () => {
+      socket.off('room_closed', onRoomClosed);
+    };
+  }, [socket, roomId, navigate, toast]);
+
   // Auth rejections are handled centrally in useSocket (refresh + reconnect).
 
   const handleEditorReady = useCallback((instance: editor.IStandaloneCodeEditor) => {
@@ -165,22 +232,62 @@ export const RoomEditor = () => {
     return text || undefined;
   }, []);
 
+  /**
+   * Hands a language switch to the server, which is now the single authority
+   * for both the room's language and whether the welcome sample is rewritten.
+   * `snippet` only records what the user meant — the server re-classifies the
+   * live document before acting on it, so a stale or wrong claim from here can
+   * never discard content that is no longer the sample.
+   */
+  const emitLanguageChange = useCallback(
+    (next: string, snippet: 'replace' | 'keep') => {
+      setLanguage(next);
+      if (roomId) socket.emit('change_language', { roomId, language: next, snippet });
+    },
+    [roomId, socket]
+  );
+
   const handleLanguageChange = useCallback(
     (next: string) => {
-      const previous = language;
-      if (next === previous) return;
-      // Switch locally right away; persist in the background so the room keeps
-      // this language on the next visit. A failure rolls the selector back.
-      setLanguage(next);
-      if (!roomId) return;
-      void api
-        .patch(`/rooms/${roomId}`, { language: next })
-        .catch((err: unknown) => {
-          setLanguage(previous);
-          toast({ title: 'Could not change the room language.', description: extractApiError(err), variant: 'error' });
+      if (next === language) return;
+
+      // Refuse while the socket is down: the switch needs a live connection to
+      // reach the other members, and applying it optimistically would flip the
+      // status bar with no way to propagate it or roll it back.
+      if (status !== 'connected') {
+        toast({
+          title: 'Not connected',
+          description: 'Reconnect to the server to change this room’s language.',
+          variant: 'error',
         });
+        return;
+      }
+
+      // This classification only decides whether the user has to be asked. The
+      // document itself is not touched here — the rewrite happens on the
+      // server and reaches us as an ordinary Yjs update, so every member sees
+      // it at the same moment as the language rather than at whatever point
+      // their own connection happened to catch up.
+      switch (classifyStarter(yText?.toString() ?? '')) {
+        case 'exact':
+          // Byte-for-byte the sample: rewriting it is unambiguously what a
+          // language switch means, so don't interrupt.
+          emitLanguageChange(next, 'replace');
+          return;
+        case 'sample-like':
+          // Still opens with the welcome banner but has been edited (the
+          // user's own tweak, or an accepted AI refactor). Rewriting would
+          // discard those edits and keeping it would leave the sample in the
+          // wrong language — we can't tell which they want, so ask.
+          setPendingSwitch(next);
+          return;
+        default:
+          // Empty, or real content: switch the highlighting only and leave the
+          // document byte-for-byte alone.
+          emitLanguageChange(next, 'keep');
+      }
     },
-    [language, roomId, toast]
+    [language, status, toast, yText, emitLanguageChange]
   );
 
   // Re-layout the editor when returning to it on mobile (it was display:none).
@@ -517,6 +624,20 @@ export const RoomEditor = () => {
         presence={presence}
         currentUserId={user?.id}
         currentUserDisplayName={user?.displayName}
+      />
+
+      <SnippetSwapDialog
+        open={pendingSwitch !== null}
+        language={pendingSwitch ? languageLabel(pendingSwitch) : ''}
+        onCancel={() => setPendingSwitch(null)}
+        onReplace={() => {
+          if (pendingSwitch) emitLanguageChange(pendingSwitch, 'replace');
+          setPendingSwitch(null);
+        }}
+        onKeep={() => {
+          if (pendingSwitch) emitLanguageChange(pendingSwitch, 'keep');
+          setPendingSwitch(null);
+        }}
       />
     </div>
   );

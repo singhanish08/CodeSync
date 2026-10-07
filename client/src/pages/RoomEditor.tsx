@@ -17,6 +17,7 @@ import { PresenceBar } from '../components/room/PresenceBar';
 import { MobileTabBar, type MobileView } from '../components/room/MobileTabBar';
 import { StatusBar } from '../components/room/StatusBar';
 import { ShareButton } from '../components/room/ShareButton';
+import { ExportButton } from '../components/room/ExportButton';
 import { ConnectionPill } from '../components/room/ConnectionPill';
 import { HistoryDrawer } from '../components/room/HistoryDrawer';
 import { SnippetSwapDialog } from '../components/room/SnippetSwapDialog';
@@ -532,6 +533,13 @@ export const RoomEditor = () => {
           </div>
 
           <ShareButton roomId={roomId ?? ''} isPublic={room?.isPublic ?? true} />
+
+          <ExportButton
+            getContent={getFileContext}
+            language={language}
+            roomName={room?.name}
+            disabled={!ready || !yText}
+          />
 
           <Tooltip content="Room activity" side="bottom">
             <button

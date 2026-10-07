@@ -43,3 +43,28 @@ export const LANGUAGE_LABELS: Record<string, string> = {
 
 export const languageLabel = (language: string): string =>
   LANGUAGE_LABELS[language] ?? language;
+
+/**
+ * Extension for the plain-text file a document is downloaded as. One entry per
+ * member of LANGUAGES; anything unexpected falls back to `.txt`.
+ */
+export const LANGUAGE_EXTENSIONS: Record<string, string> = {
+  javascript: 'js',
+  typescript: 'ts',
+  python: 'py',
+  cpp: 'cpp',
+  java: 'java',
+  go: 'go',
+  rust: 'rs',
+  c: 'c',
+  ruby: 'rb',
+  php: 'php',
+  json: 'json',
+  html: 'html',
+  css: 'css',
+  markdown: 'md',
+  bash: 'sh',
+};
+
+export const languageExtension = (language: string): string =>
+  LANGUAGE_EXTENSIONS[language] ?? 'txt';

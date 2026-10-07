@@ -6,21 +6,9 @@ import { EditHistory } from '../models/EditHistory';
 import { asyncHandler } from '../utils/asyncHandler';
 import { ApiError } from '../utils/apiError';
 import { AuthedRequest, requireAuth } from '../middleware/requireAuth';
+import { normalizeLanguage } from '../utils/languages';
 
 const router = Router();
-
-/** Languages a room can be seeded in. Mirrors the editor's language dropdown. */
-const SUPPORTED_LANGUAGES = [
-  'javascript', 'typescript', 'python', 'cpp', 'java', 'go', 'rust', 'c',
-  'ruby', 'php', 'json', 'html', 'css', 'markdown', 'bash',
-] as const;
-
-const DEFAULT_LANGUAGE = 'javascript';
-
-const normalizeLanguage = (value: unknown): string => {
-  const lang = String(value ?? '').toLowerCase();
-  return (SUPPORTED_LANGUAGES as readonly string[]).includes(lang) ? lang : DEFAULT_LANGUAGE;
-};
 
 // Every room route requires a valid access token.
 router.use(requireAuth);

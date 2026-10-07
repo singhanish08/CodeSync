@@ -36,6 +36,7 @@ const publicUser = (user: IUser) => ({
   id: user._id.toString(),
   email: user.email,
   displayName: user.displayName,
+  role: user.role,
 });
 
 // ─────────────────────────── Validation helpers ───────────────────────────
@@ -76,7 +77,7 @@ router.post(
     const passwordHash = await bcrypt.hash(String(req.body.password), 10);
     const user = await User.create({ email, passwordHash, displayName });
 
-    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName);
+    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName, user.role);
     // Establish the same persistent session login does — without this the new
     // user has no refresh cookie, so their very next /auth/refresh 401s and
     // the client tears the session down.
@@ -101,7 +102,7 @@ router.post(
     const match = await bcrypt.compare(String(req.body.password), user.passwordHash);
     if (!match) throw new ApiError(401, 'Invalid email or password.');
 
-    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName);
+    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName, user.role);
     const refreshToken = signRefreshToken(user._id.toString(), user.tokenVersion, rememberMe);
 
     res.cookie(REFRESH_COOKIE, refreshToken, refreshCookieOptions(rememberMe));
@@ -135,7 +136,7 @@ router.post(
       throw new ApiError(401, 'Session expired. Please log in again.');
     }
 
-    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName);
+    const accessToken = signAccessToken(user._id.toString(), user.tokenVersion, user.displayName, user.role);
     res.json({ accessToken, user: publicUser(user) });
   })
 );

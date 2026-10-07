@@ -8,15 +8,26 @@ interface BaseTokenPayload extends JwtPayload {
 
 interface AccessTokenPayload extends BaseTokenPayload {
   displayName: string;
+  role?: string;
 }
 
 const ACCESS_EXPIRY = '15m';
 const REMEMBER_EXPIRY = '30d';
 const SESSION_FALLBACK_EXPIRY = '1d';
 
-/** Short-lived access token. The client keeps it in memory only. */
-export const signAccessToken = (userId: string, tokenVersion: number, displayName: string): string =>
-  jwt.sign({ userId, tokenVersion, displayName } satisfies AccessTokenPayload, env.jwtAccessSecret, {
+/**
+ * Short-lived access token. The client keeps it in memory only.
+ * `role` is carried for the UI (showing the admin link) but is NEVER trusted
+ * for authorization — `requireAdmin` reloads it from the DB so a demotion
+ * takes effect immediately instead of waiting out this token's life.
+ */
+export const signAccessToken = (
+  userId: string,
+  tokenVersion: number,
+  displayName: string,
+  role: string = 'user'
+): string =>
+  jwt.sign({ userId, tokenVersion, displayName, role } satisfies AccessTokenPayload, env.jwtAccessSecret, {
     expiresIn: ACCESS_EXPIRY,
   });
 

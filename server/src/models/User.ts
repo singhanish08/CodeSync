@@ -1,9 +1,12 @@
 import { Schema, model, Document } from 'mongoose';
 
+export type UserRole = 'user' | 'admin';
+
 export interface IUser extends Document {
   email: string;
   passwordHash: string;
   displayName: string;
+  role: UserRole;
   resetTokenHash: string | null;
   resetTokenExpiry: Date | null;
   tokenVersion: number;
@@ -22,6 +25,10 @@ const userSchema = new Schema<IUser>(
     },
     passwordHash: { type: String, required: [true, 'Password hash is required'] },
     displayName: { type: String, required: [true, 'Display name is required'], trim: true },
+    // Admins reach /api/admin/*. Defaults to 'user' so existing accounts stay
+    // unchanged; promotion is a deliberate, out-of-band action (see
+    // scripts/promoteAdmin.ts), never something a user can request.
+    role: { type: String, enum: ['user', 'admin'], default: 'user' },
     resetTokenHash: { type: String, default: null },
     resetTokenExpiry: { type: Date, default: null },
     tokenVersion: { type: Number, default: 0 },

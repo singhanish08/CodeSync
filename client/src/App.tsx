@@ -8,11 +8,18 @@ import { Dashboard } from './pages/Dashboard';
 import { Landing } from './pages/Landing';
 import { NotFound } from './pages/NotFound';
 import { ProtectedRoute } from './components/ProtectedRoute';
+import { AdminRoute } from './components/AdminRoute';
 import { CaretLoader } from './components/ui/Spinner';
 
 // The editor pulls in Monaco + Yjs. Keep it out of the landing/auth bundles.
 const RoomEditor = lazy(() =>
   import('./pages/RoomEditor').then((module) => ({ default: module.RoomEditor }))
+);
+
+// The admin console is only reachable to admins; code-splitting it keeps
+// tables and icons out of every visitor's first bundle.
+const AdminDashboard = lazy(() =>
+  import('./pages/AdminDashboard').then((module) => ({ default: module.AdminDashboard }))
 );
 
 const EditorFallback = () => (
@@ -45,6 +52,16 @@ const App = () => (
             <RoomEditor />
           </Suspense>
         </ProtectedRoute>
+      }
+    />
+    <Route
+      path="/admin"
+      element={
+        <AdminRoute>
+          <Suspense fallback={<EditorFallback />}>
+            <AdminDashboard />
+          </Suspense>
+        </AdminRoute>
       }
     />
 

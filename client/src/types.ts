@@ -1,9 +1,12 @@
 /* Shared types mirrored from the backend contract. */
 
+export type UserRole = 'user' | 'admin';
+
 export interface UserDTO {
   id: string;
   email: string;
   displayName: string;
+  role: UserRole;
 }
 
 export interface RoomDTO {

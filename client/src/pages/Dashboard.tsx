@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Plus, Users, Lock, Globe, ArrowRight, Search, LogOut, AlertCircle, RefreshCw, LogIn, Check, Copy } from 'lucide-react';
+import { Plus, Users, Lock, Globe, ArrowRight, Search, LogOut, AlertCircle, RefreshCw, LogIn, Check, Copy, ShieldHalf } from 'lucide-react';
 import { api, extractApiError } from '../lib/api';
 import type { RoomDTO } from '../types';
 import { useAuth } from '../contexts/AuthContext';
@@ -272,6 +272,17 @@ export const Dashboard = () => {
               <Users size={15} />
               Rooms
             </span>
+
+            {user?.role === 'admin' && (
+              <button
+                type="button"
+                onClick={() => navigate('/admin')}
+                className="mt-1 flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-warning transition-colors hover:bg-warning/10"
+              >
+                <ShieldHalf size={15} />
+                Admin console
+              </button>
+            )}
           </nav>
 
           <div className="mt-auto flex flex-col gap-3">

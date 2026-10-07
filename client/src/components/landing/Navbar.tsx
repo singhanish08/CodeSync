@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence, useScroll, useSpring } from 'framer-motion';
-import { Menu, X } from 'lucide-react';
+import { Menu, X, ShieldHalf } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { ThemeToggle } from '../ThemeToggle';
 import { Button } from '../ui/Button';
@@ -97,6 +97,14 @@ export const Navbar = ({ onOpenPalette }: NavbarProps) => {
             <ThemeToggle />
             {user ? (
               <>
+                {/* Admin console — only rendered for accounts whose role is admin. */}
+                {user.role === 'admin' && (
+                  <Link to="/admin" className="hidden sm:block">
+                    <Button size="sm" variant="ghost" className="gap-1.5 text-warning">
+                      <ShieldHalf size={14} /> Admin
+                    </Button>
+                  </Link>
+                )}
                 <Link to="/dashboard" className="hidden sm:block">
                   <Button size="sm" variant="secondary">
                     Dashboard
@@ -175,6 +183,13 @@ export const Navbar = ({ onOpenPalette }: NavbarProps) => {
               <div className="mt-auto flex flex-col gap-3">
                 {user ? (
                   <>
+                    {user.role === 'admin' && (
+                      <Link to="/admin" onClick={() => setMenuOpen(false)}>
+                        <Button variant="secondary" className="w-full gap-1.5">
+                          <ShieldHalf size={15} /> Admin console
+                        </Button>
+                      </Link>
+                    )}
                     <Link to="/dashboard" onClick={() => setMenuOpen(false)}>
                       <Button className="w-full">Open dashboard</Button>
                     </Link>

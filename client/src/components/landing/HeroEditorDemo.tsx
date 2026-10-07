@@ -23,12 +23,20 @@ interface RemoteCursor {
   color: string;
   row: number;
   col: number;
+  /** Reveal stage: cursors land one after the other, once typing has settled. */
+  stage: number;
 }
 
+const STAGE_TYPING = 0;
+const STAGE_AI = 3;
+
 const CURSORS: RemoteCursor[] = [
-  { id: 'u-alice', name: 'Alice', color: '', row: 4, col: 36 },
-  { id: 'u-bob', name: 'Bob', color: '', row: 6, col: 24 },
+  { id: 'u-casey', name: 'Casey', color: '', row: 4, col: 36, stage: 1 },
+  { id: 'u-bob', name: 'Bob', color: '', row: 6, col: 24, stage: 2 },
 ];
+
+/** Pauses between reveal stages (ms): typing -> Casey -> Bob -> AI review. */
+const STAGE_DELAYS = [1200, 2700, 4300];
 
 interface HeroEditorDemoProps {
   className?: string;
@@ -38,7 +46,8 @@ interface HeroEditorDemoProps {
 
 /**
  * The hero's live editor: a window-chrome framed TypeScript file that types
- * itself, with two collaborator cursors drifting and an AI suggestion chip.
+ * itself, then lands its payoff in stages — Casey's cursor, Bob's cursor, and
+ * the AI review chip — each with a beat of pause, and stays there.
  * Pure CSS/React — no Monaco, no network — so it works while the server
  * sleeps.
  */
@@ -46,10 +55,25 @@ export const HeroEditorDemo = ({ className, compact = false }: HeroEditorDemoPro
   const reduced = useRef(prefersReducedMotion());
   const { text, done } = useTypewriter({
     lines: DEMO_LINES,
-    speed: compact ? 34 : 24,
+    speed: compact ? 40 : 50,
     disabled: reduced.current,
   });
   const [prismTheme, setPrismTheme] = useState(buildPrismTheme());
+
+  // Reveal stages. Reduced motion starts fully revealed and never animates.
+  const [stage, setStage] = useState(reduced.current ? STAGE_AI : STAGE_TYPING);
+
+  useEffect(() => {
+    if (reduced.current) return;
+    if (!done) {
+      setStage(STAGE_TYPING);
+      return;
+    }
+    const timers = STAGE_DELAYS.map((delay, index) =>
+      window.setTimeout(() => setStage(index + 1), delay)
+    );
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [done]);
 
   // Follow theme changes.
   useEffect(() => {
@@ -76,12 +100,10 @@ export const HeroEditorDemo = ({ className, compact = false }: HeroEditorDemoPro
       }
     >
       <div className="relative editor-surface">
-        {/* Remote collaborator cursors — appear once typing reaches their line. */}
+        {/* Remote collaborator cursors — land one at a time after typing settles. */}
         {cursors.map((cursor) => {
-          const lineIndex = Math.min(cursor.row, visibleLines.length - 1);
-          if (lineIndex < 0) return null;
-          const reached = visibleLines.length >= cursor.row;
-          if (!reached) return null;
+          if (stage < cursor.stage) return null;
+          const lineIndex = Math.min(cursor.row, Math.max(visibleLines.length - 1, 0));
           return (
             <CursorFlag
               key={cursor.id}
@@ -128,11 +150,11 @@ export const HeroEditorDemo = ({ className, compact = false }: HeroEditorDemoPro
           </Highlight>
         </div>
 
-        {/* AI suggestion chip — appears after the typing settles. */}
+        {/* AI suggestion chip — the last stage, after both cursors have landed. */}
         <div
           className={cn(
             'absolute bottom-3 right-3 max-w-[15rem] rounded-lg border border-border bg-bg-secondary/90 p-2.5 shadow-lifted backdrop-blur transition-all duration-500',
-            done ? 'translate-y-0 opacity-100' : 'translate-y-2 opacity-0'
+            stage >= STAGE_AI ? 'translate-y-0 opacity-100' : 'translate-y-2 opacity-0'
           )}
         >
           <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-accent">

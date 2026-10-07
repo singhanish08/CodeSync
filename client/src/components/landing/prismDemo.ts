@@ -54,66 +54,66 @@ export const DEMO_LANGUAGE: Language = 'tsx';
 
 interface UseTypewriterArgs {
   lines: string[];
-  /** Characters revealed per tick. */
+  /** Milliseconds per revealed character. */
   speed?: number;
-  /** Delay before the loop restarts (ms). */
-  restartDelay?: number;
   /** Disable entirely (reduced motion). */
   disabled?: boolean;
 }
 
 /**
- * Types `lines` out character-by-character, then clears and restarts — the
- * "code that types itself" motif. Returns the visible text and caret state.
+ * Types `lines` out one character at a time and then HOLDS the final text, so
+ * the demo settles instead of looping back to an empty editor.
+ *
+ * The reveal runs on a single self-scheduling `setTimeout` created in this
+ * effect and cleared on unmount. Nothing is ever scheduled from inside a
+ * `setCount` updater: updaters must be pure, React double-invokes them under
+ * StrictMode, and scheduling a timer there used to spawn a second chain on
+ * every tick (the orphan was invisible because the `timer` binding was
+ * overwritten). Those chains multiplied and each restarted on its own — the
+ * strobing flicker was all of them clearing and retyping out of phase.
  */
-export const useTypewriter = ({ lines, speed = 28, restartDelay = 2600, disabled = false }: UseTypewriterArgs) => {
+export const useTypewriter = ({ lines, speed = 50, disabled = false }: UseTypewriterArgs) => {
   const fullText = useMemo(() => lines.join('\n'), [lines]);
   const [count, setCount] = useState(disabled ? fullText.length : 0);
   const [done, setDone] = useState(disabled);
 
   useEffect(() => {
-    if (disabled) {
+    if (disabled || fullText.length === 0) {
       setCount(fullText.length);
       setDone(true);
       return;
     }
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let revealed = 0;
+    let mounted = true;
+
     setCount(0);
     setDone(false);
 
-    let timer: ReturnType<typeof setTimeout>;
-    let mounted = true;
-
-    const tick = () => {
+    const typeNext = () => {
       if (!mounted) return;
-      setCount((current) => {
-        if (current >= fullText.length) {
-          setDone(true);
-          timer = setTimeout(() => {
-            if (!mounted) return;
-            setCount(0);
-            setDone(false);
-            timer = setTimeout(tick, speed);
-          }, restartDelay);
-          return current;
-        }
-        // Reveal 1-3 characters per tick for organic pacing.
-        const step = 1 + Math.floor(Math.random() * 3);
-        timer = setTimeout(tick, speed + Math.random() * 18);
-        return Math.min(current + step, fullText.length);
-      });
+
+      revealed += 1;
+      setCount(revealed);
+
+      if (revealed >= fullText.length) {
+        setDone(true); // settled — nothing restarts, so the text stays put
+        return;
+      }
+
+      timer = setTimeout(typeNext, speed);
     };
 
-    timer = setTimeout(tick, 450);
+    timer = setTimeout(typeNext, 450);
 
     return () => {
       mounted = false;
       clearTimeout(timer);
     };
-  }, [fullText, speed, restartDelay, disabled]);
+  }, [fullText, speed, disabled]);
 
-  const text = fullText.slice(0, count);
-  return { text, done, showCaret: !done || disabled === false };
+  return { text: fullText.slice(0, count), done };
 };
 
 /** Pauses animation loops when the tab is hidden (battery friendly). */

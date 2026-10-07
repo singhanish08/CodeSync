@@ -12,6 +12,8 @@ import {
   type AiChange,
 } from '../services/groqService';
 import { buildCodeContext } from '../services/treeSitterService';
+import { normalizeLanguage, DEFAULT_LANGUAGE } from '../utils/languages';
+import { starterContent, classifyStarter } from '../utils/starterContent';
 import { env } from '../config/env';
 
 // ─────────────────────────────── Types ─────────────────────────────────────
@@ -36,6 +38,13 @@ interface RoomState {
   pendingSuggestions: Map<string, PendingSuggestion>;
   saveTimer: NodeJS.Timeout | null;
   lastHumanEditLog: number;
+  /**
+   * The room's language as this process last persisted it. It is the
+   * `previous` a language switch converts FROM, so it has to be tracked here —
+   * reading a client's React state (or re-reading Mongo mid-flight) would let
+   * two members disagree about what the document currently is.
+   */
+  language: string;
 }
 
 // ───────────────────────────── In-memory rooms ─────────────────────────────
@@ -47,6 +56,30 @@ const HUMAN_EDIT_LOG_THROTTLE_MS = 3_000;
 // close the reconnect ordering race (see yjs_update); the two-step sync
 // recovers anything beyond this, so the bound just guards memory.
 const MAX_QUEUED_UPDATES = 500;
+
+/**
+ * Rooms in the middle of an admin close/delete. A join that races the teardown
+ * — it read the Room doc before we deleted it, then reached
+ * getOrCreateRoomState after — would otherwise resurrect a fresh in-memory
+ * state for a room that no longer exists, and the tombstone'd doc delete would
+ * then leave that state orphaned and writing to Mongo forever. Entries expire
+ * after the teardown is certain to have finished.
+ */
+const tombstones = new Map<string, number>();
+const TOMBSTONE_TTL_MS = 30_000;
+
+const addTombstone = (roomId: string): void => {
+  tombstones.set(roomId, Date.now() + TOMBSTONE_TTL_MS);
+};
+
+/** True while a teardown is in flight (and clears stale entries as it goes). */
+const hasTombstone = (roomId: string): boolean => {
+  const expiry = tombstones.get(roomId);
+  if (expiry === undefined) return false;
+  if (Date.now() <= expiry) return true;
+  tombstones.delete(roomId);
+  return false;
+};
 
 const PALETTE = [
   '#f87171', '#fb923c', '#facc15', '#4ade80', '#34d399',
@@ -98,6 +131,38 @@ const createRoomState = async (roomId: string): Promise<RoomState> => {
   doc.getText('content'); // ensure the shared text exists
   const awareness = new awarenessProtocol.Awareness(doc);
 
+  let language = DEFAULT_LANGUAGE;
+  // Set only for a room that has never had a snapshot written. Distinguishing
+  // "never saved" from "saved empty" matters: someone who deliberately cleared
+  // the file must not get the welcome snippet back after every restart.
+  let neverSaved = false;
+
+  try {
+    const room = await Room.findById(roomId).lean();
+    language = normalizeLanguage(room?.language);
+    const persisted = yjsStateToUint8(room?.yjsDocState);
+    if (persisted && persisted.length) {
+      Y.applyUpdate(doc, persisted);
+      console.log(`[socket] Restored ${persisted.length}b of persisted state for room ${roomId}`);
+    } else if (room && !room.yjsDocState) {
+      neverSaved = true;
+    }
+  } catch (err) {
+    console.warn(`[socket] Could not restore persisted state for room ${roomId}:`, err);
+  }
+
+  // Seed on the SERVER, in the room's own language, for a room nothing has
+  // ever been written to. Every member then opens on a document that already
+  // matches the status bar from the first frame — no racing the REST fetch for
+  // the language the client should seed with, and no two members seeding
+  // different snippets into the same empty doc.
+  if (neverSaved) {
+    doc.transact(() => {
+      doc.getText('content').insert(0, starterContent(language));
+    });
+    console.log(`[socket] Seeded the ${language} welcome snippet for new room ${roomId}`);
+  }
+
   const state: RoomState = {
     doc,
     awareness,
@@ -105,18 +170,8 @@ const createRoomState = async (roomId: string): Promise<RoomState> => {
     pendingSuggestions: new Map(),
     saveTimer: null,
     lastHumanEditLog: 0,
+    language,
   };
-
-  try {
-    const room = await Room.findById(roomId).lean();
-    const persisted = yjsStateToUint8(room?.yjsDocState);
-    if (persisted && persisted.length) {
-      Y.applyUpdate(doc, persisted);
-      console.log(`[socket] Restored ${persisted.length}b of persisted state for room ${roomId}`);
-    }
-  } catch (err) {
-    console.warn(`[socket] Could not restore persisted state for room ${roomId}:`, err);
-  }
 
   state.saveTimer = setInterval(() => {
     void persistRoom(roomId, state);
@@ -135,6 +190,10 @@ const pendingRoomState = new Map<string, Promise<RoomState>>();
 const getOrCreateRoomState = async (roomId: string): Promise<RoomState> => {
   const existing = rooms.get(roomId);
   if (existing) return existing;
+
+  // A teardown is mid-flight for this room — refuse instead of resurrecting
+  // state for a room on its way out (see the tombstone comment).
+  if (hasTombstone(roomId)) throw new Error('Room is closing');
 
   const inFlight = pendingRoomState.get(roomId);
   if (inFlight) return inFlight;
@@ -195,6 +254,83 @@ export const flushAllRooms = async (): Promise<void> => {
   if (ids.length) console.info(`[socket] persisted ${ids.length} room(s) on shutdown`);
 };
 
+/**
+ * Admin room teardown. The io instance is captured at registration, so callers
+ * from the REST layer never have to thread it through themselves. Order is
+ * load-bearing:
+ *
+ *   1. tell everyone in the room it is gone (clients toast + leave the page),
+ *   2. disconnect those sockets so no further edits can land mid-teardown,
+ *   3. clear the save timer and drop the in-memory state,
+ *   4. delete the DB records.
+ *
+ * The tombstone is set BEFORE step 1 so a join racing through the window
+ * between "doc still exists" and "state deleted" hits the tombstone in
+ * getOrCreateRoomState instead of rebuilding a room we are about to destroy.
+ */
+let ioRef: Server | null = null;
+
+export const getIo = (): Server | null => ioRef;
+
+/**
+ * Force-closes a room's live session: kicks every occupant and drops the
+ * in-memory Yjs state, but keeps the persisted document. Two-step delete uses
+ * this as step one, and it is also exposed directly so an admin can empty a
+ * room without deleting its content. Returns how many occupants were kicked.
+ */
+export const closeRoom = async (roomId: string, reason: string): Promise<number> => {
+  const io = ioRef;
+  const state = rooms.get(roomId);
+  if (!io || !state) return 0;
+
+  addTombstone(roomId);
+  const occupantCount = state.clients.size;
+
+  // Step 1 — the payload drives the client's toast copy.
+  io.to(roomId).emit('room_closed', { roomId, reason });
+
+  // Step 2 — `true` closes the underlying transport, not just the namespace
+  // room. Disconnecting before tearing down means no edit can arrive between
+  // here and the DB delete.
+  io.in(roomId).disconnectSockets(true);
+
+  // Step 3 — the clients map is drained by the disconnect handler, but the
+  // save timer would otherwise keep writing the (now abandoned) doc forever.
+  if (state.saveTimer) clearInterval(state.saveTimer);
+  rooms.delete(roomId);
+  pendingRoomState.delete(roomId);
+
+  console.info(`[socket] admin closed room ${roomId} (${reason}) — ${occupantCount} occupant(s) kicked`);
+  return occupantCount;
+};
+
+/**
+ * Live occupancy for the admin panel — the one stat the DB cannot answer,
+ * since it lives in the in-memory room map.
+ */
+export const getLiveOccupancy = (): Array<{ roomId: string; occupants: string[] }> =>
+  [...rooms.entries()].map(([roomId, state]) => ({
+    roomId,
+    occupants: [...state.clients.values()].map((client) => client.displayName),
+  }));
+
+/**
+ * Deletes a room outright: closes the live session, then removes the room and
+ * its edit history. Requires the caller to have already confirmed access —
+ * this is the step-two half of the two-step admin delete.
+ */
+export const deleteRoom = async (roomId: string, reason: string): Promise<{ kicked: number }> => {
+  const kicked = await closeRoom(roomId, reason);
+
+  // Step 4 — order matters: delete the room first so a join that slips past
+  // the (now expired) tombstone still finds nothing to open.
+  await Room.deleteOne({ _id: roomId });
+  await EditHistory.deleteMany({ roomId });
+
+  console.info(`[socket] admin deleted room ${roomId} (${reason})`);
+  return { kicked };
+};
+
 // ───────────────────────── AI suggestion application ───────────────────────
 
 /**
@@ -236,6 +372,26 @@ const applySuggestionToDoc = (state: RoomState, changes: AiChange[], origin: unk
 
 // ────────────────────────────── Edit logging ───────────────────────────────
 
+/**
+ * Serialises language changes per room. The handler awaits the database write
+ * before broadcasting, so without this two switches in quick succession (JS →
+ * Python → TypeScript) can interleave at the await and have the *older* result
+ * broadcast last — leaving every collaborator stuck on Python while the room is
+ * stored as TypeScript. Chaining keeps "persist then broadcast" atomic per room.
+ */
+const languageChangeQueues = new Map<string, Promise<void>>();
+
+const enqueueLanguageChange = (roomId: string, work: () => Promise<void>): void => {
+  const previous = languageChangeQueues.get(roomId) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  languageChangeQueues.set(roomId, next);
+  // Keep the map from growing without bound once the chain has settled.
+  const settle = (): void => {
+    if (languageChangeQueues.get(roomId) === next) languageChangeQueues.delete(roomId);
+  };
+  void next.then(settle, settle);
+};
+
 const logEdit = (roomId: string, userId: string | null, type: 'human_edit' | 'ai_accepted' | 'ai_rejected' | 'ai_suggestion', summary: string): void => {
   EditHistory.create({ roomId, userId, type, summary }).catch((err) =>
     console.error(`[socket] Failed to write EditHistory (${type}) for room ${roomId}:`, err)
@@ -272,6 +428,51 @@ const applyAndBroadcast = (
 };
 
 /**
+ * Rewrites the document with `nextLanguage`'s welcome snippet when the current
+ * content still is (or still looks like) the sample, and reports whether it did.
+ *
+ * This is decided HERE, from the live document, never from what the client
+ * claims — the defect this exists to fix was a client that silently declined to
+ * swap and left the room's language and its content permanently disagreeing.
+ * `wantsReplace` is only the user's answer to the ambiguity prompt: it is
+ * honoured for content this classifier also considers sample-like, an untouched
+ * starter is swapped regardless, and content we classify as real work is never
+ * touched however much the client asks.
+ */
+const replaceStarterIfAsked = (
+  io: Server,
+  roomId: string,
+  state: RoomState,
+  nextLanguage: string,
+  wantsReplace: boolean,
+  userId: string
+): boolean => {
+  const text = state.doc.getText('content').toString();
+  const next = starterContent(nextLanguage);
+  if (text === next) return false;
+
+  const kind = classifyStarter(text);
+  const shouldReplace = kind === 'exact' || (kind === 'sample-like' && wantsReplace);
+  if (!shouldReplace) return false;
+
+  state.doc.transact(() => {
+    const target = state.doc.getText('content');
+    target.delete(0, target.length);
+    target.insert(0, next);
+  }, 'language_change');
+
+  // No socket owns this edit — the server made it — so unlike applyAndBroadcast
+  // there is no sender to exclude. Everyone in the room, the instigator
+  // included, receives it as an ordinary Yjs update and converges exactly as
+  // they do on a typed edit.
+  const update = Y.encodeStateAsUpdate(state.doc);
+  io.to(roomId).emit('yjs_update', { update: toBase64(update), roomId });
+
+  logEdit(roomId, userId, 'human_edit', `Language changed to ${nextLanguage} — welcome snippet rewritten`);
+  return true;
+};
+
+/**
  * The authoritative room for an incoming packet is `socket.data.roomId` (a
  * socket lives in exactly one room in this app). If the packet also names a
  * room and it disagrees, the packet is a cross-room leak and is rejected.
@@ -286,6 +487,7 @@ const resolveRoomId = (socket: Socket, payloadRoomId: unknown): string | null =>
 // ───────────────────────────── Auth middleware ─────────────────────────────
 
 export const registerSocketHandlers = (io: Server): void => {
+  ioRef = io;
   // Verify the access token passed in socket.handshake.auth.token.
   io.use((socket: Socket, next) => {
     try {
@@ -351,7 +553,18 @@ export const registerSocketHandlers = (io: Server): void => {
           return;
         }
 
-        const state = await getOrCreateRoomState(roomId);
+        let state: RoomState;
+        try {
+          state = await getOrCreateRoomState(roomId);
+        } catch {
+          // A tombstone from an admin teardown beat us: the room is gone (or
+          // going). Report it as "not found" so the client routes to the
+          // dashboard rather than retrying a join that can never succeed.
+          delete socket.data.roomId;
+          console.warn(`[server] socket ${socket.id} — room ${roomId} is closing`);
+          socket.emit('error', { message: 'This room is being closed. Please head back to the dashboard.' });
+          return;
+        }
         socket.join(roomId);
         // Confirms the Socket.io room membership actually happened — without
         // this, `socket.to(roomId)` broadcasts silently reach nobody.
@@ -387,6 +600,10 @@ export const registerSocketHandlers = (io: Server): void => {
           update: toBase64(reply),
           stateVector: toBase64(Y.encodeStateVector(state.doc)),
           presence: Array.from(state.clients.values()),
+          // The room's own language, so a client that seeds an empty document
+          // uses the same one the status bar is about to show rather than
+          // whichever language its REST fetch happened to land on first.
+          language: state.language,
         });
 
         // Replay every collaborator's current awareness to the newcomer.
@@ -503,11 +720,97 @@ export const registerSocketHandlers = (io: Server): void => {
         const state = rooms.get(roomId);
         if (!state) return;
 
-        awarenessProtocol.applyAwarenessUpdate(state.awareness, fromBase64(update), socket);
+        // Remember the Yjs client ids this connection has published awareness
+        // for, so a disconnect can purge them. Awareness states are keyed by the
+        // publisher's Y.Doc clientID (not the socket id), and y-protocols never
+        // clears them on its own — without this record a closed tab's caret
+        // would outlive it. See the disconnect handler.
+        const captured: number[] = [];
+        const capture = ({ added, updated }: { added: number[]; updated: number[] }) => {
+          for (const id of added) captured.push(id);
+          for (const id of updated) captured.push(id);
+        };
+        state.awareness.on('update', capture);
+        try {
+          awarenessProtocol.applyAwarenessUpdate(state.awareness, fromBase64(update), socket);
+        } finally {
+          state.awareness.off('update', capture);
+        }
+        if (captured.length) {
+          const known = new Set<number>([
+            ...((socket.data.awarenessClientIds as number[] | undefined) ?? []),
+            ...captured,
+          ]);
+          socket.data.awarenessClientIds = [...known];
+        }
+
         socket.to(roomId).emit('awareness_update', { update, roomId });
       } catch (err) {
         console.error('[socket] awareness_update failed:', err);
       }
+    });
+
+    // ──────────────────────── change_language ─────────────────────────────
+    // A member switched the language in the status bar. The room is the source
+    // of truth: persist first, then broadcast what actually got stored to
+    // everyone in the room. Sending the persisted value means an out-of-range
+    // language is corrected rather than half-applied, and every browser lands on
+    // the same mode.
+    //
+    // The welcome-snippet swap happens HERE rather than in the switcher, so
+    // there is exactly one authority for what the document becomes and every
+    // member converges on it in the same tick as the language. The switcher
+    // classifies the document to decide whether to ask the user first, but its
+    // answer is only a hint — replaceStarterIfAsked re-classifies the live
+    // document and refuses to touch anything that is not still the sample.
+    socket.on('change_language', (payload: unknown) => {
+      const { language: requested, roomId: payloadRoomId, snippet } = (payload ?? {}) as {
+        language?: string;
+        roomId?: string;
+        snippet?: unknown;
+      };
+
+      // resolveRoomId rejects anything from a socket that has not joined this
+      // room, so only a genuine member can switch the language.
+      const roomId = resolveRoomId(socket, payloadRoomId);
+      if (!roomId) {
+        socket.emit('error', { message: 'Join a room before changing its language.' });
+        return;
+      }
+      if (!rooms.has(roomId)) {
+        socket.emit('error', { message: 'This room is not live right now.' });
+        return;
+      }
+
+      const next = normalizeLanguage(requested);
+      // The user's answer to "this document still looks like the sample but has
+      // been edited — replace it?". Absent/`keep` means keep the content.
+      const wantsReplace = snippet === 'replace';
+
+      enqueueLanguageChange(roomId, async () => {
+        const state = rooms.get(roomId);
+        // The room can be evicted while this waits its turn in the queue.
+        if (!state) return;
+
+        try {
+          await Room.updateOne({ _id: roomId }, { $set: { language: next } });
+        } catch (err) {
+          // Never broadcast a language we failed to store — the room and its
+          // members would then disagree with the document.
+          console.error(`[socket] Failed to persist language for room ${roomId}:`, err);
+          return;
+        }
+        state.language = next;
+
+        const snippetReplaced = replaceStarterIfAsked(io, roomId, state, next, wantsReplace, user.id);
+        // The rewrite is content, not a language field — persist it now rather
+        // than leaving it up to the 30s snapshot timer, or a restart would put
+        // the old snippet back under the new language and recreate the exact
+        // mismatch this handler exists to prevent.
+        if (snippetReplaced) await persistRoom(roomId, state);
+
+        io.to(roomId).emit('language_changed', { roomId, language: next, snippetReplaced });
+      });
     });
 
     // ─────────────────────────── summon_ai ─────────────────────────────
@@ -639,10 +942,30 @@ export const registerSocketHandlers = (io: Server): void => {
     socket.on('disconnect', async (reason: DisconnectReason) => {
       console.info(`[socket] ${user.displayName} disconnected (${socket.id}) — disconnecting due to: ${reason}`);
       const roomId = socket.data.roomId as string | undefined;
-      if (roomId) {
-        const state = rooms.get(roomId);
-        if (state) await removeClientFromRoom(socket, state, roomId);
+      const state = roomId ? rooms.get(roomId) : undefined;
+
+      // Drop this connection's cursors and selections from the room. y-protocols
+      // will not do it: its own expiry only fires from a timer, so a tab closed
+      // mid-session leaves its caret behind in `awareness`, and the join handler
+      // then replays that stale state to everyone who opens the room afterwards —
+      // painting a cursor, at a position that no longer means anything, for
+      // someone who already left.
+      const clientIds = (socket.data.awarenessClientIds as number[] | undefined) ?? [];
+      if (state && clientIds.length) {
+        const live = clientIds.filter((id) => state.awareness.getStates().has(id));
+        if (live.length) {
+          awarenessProtocol.removeAwarenessStates(state.awareness, live, null);
+          // Relay the removal so anyone still in the room stops drawing the
+          // cursor now, rather than up to 30s later when it times out.
+          const removal = awarenessProtocol.encodeAwarenessUpdate(state.awareness, live);
+          io.to(roomId as string).emit('awareness_update', {
+            update: toBase64(removal),
+            roomId,
+          });
+        }
       }
+
+      if (roomId && state) await removeClientFromRoom(socket, state, roomId);
       // Nothing is joining this socket anymore; drop any unreplayed queue.
       socket.data.pendingUpdates = [];
     });

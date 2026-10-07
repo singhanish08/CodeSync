@@ -5,6 +5,7 @@ import { env } from './config/env';
 import { ApiError } from './utils/apiError';
 import authRoutes from './routes/authRoutes';
 import roomRoutes from './routes/roomRoutes';
+import adminRoutes from './routes/adminRoutes';
 
 /**
  * Creates the Express app. Kept separate from index.ts so the HTTP server
@@ -36,6 +37,7 @@ export const createApp = (): express.Application => {
 
   app.use('/api/auth', authRoutes);
   app.use('/api/rooms', roomRoutes);
+  app.use('/api/admin', adminRoutes);
 
   // 404 for unknown routes.
   app.use((_req: Request, res: Response) => {

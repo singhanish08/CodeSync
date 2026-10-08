@@ -2,17 +2,20 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Mail, Lock, ArrowRight } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { extractApiError } from '../lib/api';
 import { AuthLayout } from '../components/AuthLayout';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Switch } from '../components/ui/Switch';
 import { GradientText } from '../components/ui/GradientText';
+import { useToast } from '../components/ui/Toast';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const Login = () => {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const { toast } = useToast();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -36,8 +39,17 @@ export const Login = () => {
     try {
       await login(email, password, rememberMe);
       navigate('/dashboard');
-    } catch {
-      // The AuthContext already stores the message in `error`.
+    } catch (err) {
+      // Nothing was rendered on a failed attempt before this: AuthContext only
+      // parks the message in `error`, which this page never reads. The API
+      // already returns bad credentials as ONE combined message ("Invalid
+      // email or password."), so it is passed through verbatim — never split
+      // into a wrong-email vs wrong-password hint here.
+      toast({
+        title: 'Login Failed',
+        description: extractApiError(err, 'Could not reach the server. Check your connection and try again.'),
+        variant: 'error',
+      });
     } finally {
       setSubmitting(false);
     }

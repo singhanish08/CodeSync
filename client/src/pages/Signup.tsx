@@ -2,9 +2,11 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Mail, Lock, User, ArrowRight } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { extractApiError } from '../lib/api';
 import { AuthLayout } from '../components/AuthLayout';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
+import { useToast } from '../components/ui/Toast';
 import { cn } from '../lib/utils';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -34,6 +36,7 @@ const scorePassword = (password: string): PasswordScore => {
 export const Signup = () => {
   const { signup } = useAuth();
   const navigate = useNavigate();
+  const { toast } = useToast();
 
   const [displayName, setDisplayName] = useState('');
   const [email, setEmail] = useState('');
@@ -58,8 +61,17 @@ export const Signup = () => {
     try {
       await signup(email, password, displayName);
       navigate('/dashboard');
-    } catch {
-      // The AuthContext stores the message in `error`.
+    } catch (err) {
+      // Same gap Login had: AuthContext parks the message in `error`, which
+      // this page never reads, so a failed sign-up looked like a dead button.
+      // The API's own reason ("An account with that email already exists.",
+      // validation errors) is passed through verbatim; only a transport
+      // failure falls back to the connection wording.
+      toast({
+        title: 'Signup Failed',
+        description: extractApiError(err, 'Could not reach the server. Check your connection and try again.'),
+        variant: 'error',
+      });
     } finally {
       setSubmitting(false);
     }

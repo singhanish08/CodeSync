@@ -13,7 +13,11 @@ Built as a TypeScript monorepo: `client/` (React + Vite) and `server/` (Express 
 - **AI assistant (Groq, `openai/gpt-oss-120b`)** — three modes: Explain, Review, and Refactor. Responses stream live to the entire room.
 - **Diff-based refactor suggestions** — the AI returns strict JSON (`response_format: json_object`) with line-range changes; accepting applies them via a proper `Y.Doc.transact` on the shared `Y.Text` so they merge safely with concurrent human edits.
 - **Tree-sitter context extraction** — the file is parsed and the AI receives a compact structured view (symbol names, signatures, line ranges, plus the enclosing function/class of a selection) instead of a raw file dump. Grammars ship for JavaScript, TypeScript, Python, C, C++, Java, Go, Rust, Ruby, JSON, HTML, CSS and Bash; PHP and Markdown fall back to raw text on this platform (see "Known limitations").
+- **Server-authoritative language switching** — the language dropdown sends `change_language`; the server persists `Room.language` and decides whether the starter snippet is rewritten, then broadcasts `language_changed` so every client retargets Monaco together (see "How real-time sync works").
+- **Upload a file into the room** — toolbar → **Upload**: text files up to **1 MB** (the client refuses binary files by magic bytes and control characters; the server re-checks size, type and language), a confirm modal, then the shared document is replaced for everyone as a single transaction. The file's extension sets the room's language; an unrecognised extension keeps the current one.
+- **Export the buffer** — toolbar → **Export** downloads the current document with the extension for the active language.
 - **Custom JWT auth** — 15-minute access tokens (kept in memory), httpOnly refresh cookies, `tokenVersion` invalidation on password reset, Gmail-based password reset with SHA-256-hashed tokens and anti-enumeration responses.
+- **Remember me & visible failures** — the login checkbox opts into a 30-day refresh cookie (unchecked → a browser-session cookie), and login/signup failures surface as a toast carrying the server's message instead of a silent no-op.
 - **Proactive token refresh** — the client refreshes ~1 minute before expiry and reconnects the socket with the new token, so an active session is never silently dropped. A 401 also triggers a single silent retry.
 - **Three themes** — Light, Dark, and a warm low-blue-light **Eye Shield** mode, applied consistently across the app *and* Monaco via three custom registered editor themes. Persisted in `localStorage`.
 - **Fully responsive** — desktop gets the editor + docked AI panel; mobile gets a bottom tab bar (Editor / AI Review / Presence), each view full-width.
@@ -50,12 +54,13 @@ CodeSync/
 │   │   │   ├── landing/    # Landing sections + client-side demos
 │   │   │   ├── editor/     # CodeEditor (Monaco + y-monaco)
 │   │   │   ├── ai/         # AIPanel + DiffView (real `diff` package)
-│   │   │   └── room/       # StatusBar, PresenceBar, HistoryDrawer, …
+│   │   │   └── room/       # StatusBar, PresenceBar, ShareButton,
+│   │   │                   #   UploadButton, ExportButton, HistoryDrawer, …
 │   │   ├── contexts/       # ThemeContext, AuthContext
 │   │   ├── pages/          # Landing, Login…ResetPassword, Dashboard,
 │   │   │                   #   RoomEditor, NotFound
 │   │   ├── hooks/          # useSocket, useYjsDoc, useAuth
-│   │   ├── lib/            # api, socket, monacoSetup, themeBus, utils
+│   │   ├── lib/            # api, socket, languages, monacoSetup, themeBus, utils
 │   │   └── styles/         # globals.css (theme tokens)
 │   └── package.json
 ├── server/                 # Express + TS backend
@@ -182,6 +187,7 @@ Open <http://localhost:5176>, create an account, create a room, and start editin
 3. Local edits produce `yjs_update` events (base64). The server applies them to the room doc and relays them to other clients, who `Y.applyUpdate` them.
 4. Cursor/selection state rides on `awareness_update` (y-protocols awareness), rendered by y-monaco as colored cursors with name labels.
 5. Every 30s (and when the last user leaves), the server snapshots `Y.encodeStateAsUpdate(doc)` into `Room.yjsDocState`.
+6. Language switches and file uploads are *not* free-form keystrokes — they travel as `change_language` / `upload_file` through a **per-room mutation queue** (`enqueueRoomMutation`), so an upload can never interleave with a language switch and leave the room with half of each applied.
 
 ### Socket.io events
 
@@ -192,6 +198,12 @@ Open <http://localhost:5176>, create an account, create a room, and start editin
 | `yjs_update`         | both      | `{ update: base64 }`                                           |
 | `awareness_update`   | both      | `{ update: base64 }`                                           |
 | `presence_update`    | S → C     | `{ users: PresenceUser[] }`                                    |
+| `leave_room`         | C → S     | `{ roomId }` — drops membership and runs the last-user-leaves snapshot |
+| `sync_step_2`        | C → S     | `{ roomId, update: base64 }` — missing-state backfill when a client detects a gap |
+| `change_language`    | C → S     | `{ roomId, language, snippet }` — `snippet` is `replace` \| `keep`; the server persists the language and decides whether to rewrite the starter sample |
+| `language_changed`   | S → C     | `{ roomId, language, snippetReplaced }` — broadcast to the room, authority for every client's Monaco mode |
+| `upload_file`        | C → S     | `{ roomId, language, content }` — server re-validates (≤ 1 MB, string content, known language), then replaces the document in one transaction and echoes `yjs_update` + `language_changed` |
+| `room_closed`        | S → C     | `{ roomId, reason }` — the owner deleted the room; clients fall back to the dashboard |
 | `summon_ai`          | C → S     | `{ roomId, mode, selectedCode?, fullFileContext, language }`   |
 | `ai_stream_chunk`    | S → C     | `{ suggestionId, token }`                                      |
 | `ai_stream_end`      | S → C     | `{ suggestionId, mode, summonedByName }`                       |
@@ -288,10 +300,20 @@ That's the whole surface area — no component needs to change, because nothing 
    - `VITE_SOCKET_URL` = same origin
 4. Deploy.
 
+> **Deep links need two things that live in `client/`:**
+>
+> - `client/vercel.json` — the catch-all rewrite `{"rewrites":[{"source":"/(.*)","destination":"/index.html"}]}` so `/room/:roomId`, `/dashboard`, `/login` and `/reset-password?token=…` survive a refresh (Vercel resolves every URL as a filesystem path unless told otherwise).
+> - `base: '/'` in `client/vite.config.ts` — an absolute base so the JS/CSS in `index.html` resolve to `/assets/…` instead of `./assets/…`, which would resolve to `/room/assets/…` on a nested route and come back as HTML.
+>
+> Vercel reads `vercel.json` from the **Root Directory** (`client/`), *not* from `dist/`, so it must be committed with the app — anything above the Root Directory is outside the build's reach.
+
 ### Production checklist
 
-- ✅ `NODE_ENV=production` on the backend so the refresh cookie is `Secure` + `SameSite=None` (required for the cross-domain Vercel→Render cookie).
+- ✅ `NODE_ENV=production` on the backend so the refresh cookie is `Secure` + `SameSite=None` (required for the cross-domain Vercel→Render cookie). Render sets this automatically at runtime for Node services.
 - ✅ `FRONTEND_URL` set to the exact Vercel origin — the server's CORS allows only that origin with `credentials: true`.
+- ✅ Set `VITE_API_URL` / `VITE_SOCKET_URL` **before the first Vercel build** — both silently fall back to `http://localhost:5175` and would be baked into the bundle.
+- ✅ `client/vercel.json` is committed and `base` is `'/'`; smoke-test a hard refresh on `/room/<id>` and on `/dashboard`.
+- ✅ The Atlas `MONGODB_URI` ends in a database name (e.g. `/codesync?retryWrites=true&w=majority`) — without one, Mongoose writes to its default `test` database.
 - ✅ In your browser, third-party cookies must be allowed for the Render domain, or the refresh cookie will be blocked (a limitation of cross-origin httpOnly cookies in 2026-era browsers — if your users have third-party cookies blocked, consider serving the frontend and API from the same domain via a proxy).
 
 ---
@@ -353,6 +375,7 @@ All REST routes are prefixed with `/api`.
 - **Third-party cookies** are required for cross-domain refresh to work in production (see the production checklist above).
 - **Bundle size.** Monaco is bundled locally (rather than loaded from a CDN) so the app is self-contained and reliable on Vercel. It lives in a dedicated **lazy chunk** that only the editor route ever imports — the landing page loads zero Monaco bytes (verified at build time: the main chunk contains no `monaco` references). Vercel further serves the language workers as separate lazily-loaded chunks.
 - **Edit history** logs human edits in throttled batches (~1 per 3s per room), not per keystroke.
+- **Uploads are capped at 1 MB and must be text.** `MAX_UPLOAD_BYTES` in `client/src/components/room/UploadButton.tsx` is enforced again in `socketHandlers.ts`, which also rejects non-string content and unknown languages. Binary sniffing (magic bytes for PNG/PDF/zip/gzip/ELF/JPEG, plus control characters) happens **client-side only**, so a hand-crafted socket frame with binary bytes would reach the document — the cap and the language check are what the server guarantees. The filename extension is the only language signal: an unknown extension still uploads but leaves the room's language untouched.
 - **`npm install` on Render** runs inside `server/`; because the root declares npm workspaces, npm walks up and may install the client tree too. If that becomes a problem, remove the `workspaces` field from the root `package.json` (it is only a local-dev convenience) or set Render's root directory appropriately.
 
 ## License

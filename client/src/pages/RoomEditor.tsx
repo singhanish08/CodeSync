@@ -18,6 +18,7 @@ import { MobileTabBar, type MobileView } from '../components/room/MobileTabBar';
 import { StatusBar } from '../components/room/StatusBar';
 import { ShareButton } from '../components/room/ShareButton';
 import { ExportButton } from '../components/room/ExportButton';
+import { UploadButton, type UploadFile } from '../components/room/UploadButton';
 import { ConnectionPill } from '../components/room/ConnectionPill';
 import { HistoryDrawer } from '../components/room/HistoryDrawer';
 import { SnippetSwapDialog } from '../components/room/SnippetSwapDialog';
@@ -291,6 +292,39 @@ export const RoomEditor = () => {
     [language, status, toast, yText, emitLanguageChange]
   );
 
+  /**
+   * Sends a confirmed upload to the server, which owns the rewrite. Nothing is
+   * applied locally: the replacement lands as an ordinary Yjs update from the
+   * server, so this tab and every other tab converge on the same bytes at the
+   * same moment rather than this one racing ahead. The language is set
+   * optimistically for immediate status-bar feedback, and the server's
+   * `language_changed` broadcast is the authority if it differs.
+   *
+   * An upload with an unrecognised extension arrives with `language: null` —
+   * the file was not classified, so the room keeps the language it already
+   * had rather than being silently flipped to JavaScript.
+   */
+  const handleUpload = useCallback(
+    (file: UploadFile) => {
+      if (!roomId) return;
+
+      if (status !== 'connected') {
+        toast({
+          title: 'Not connected',
+          description: 'Reconnect to the server before uploading a file.',
+          variant: 'error',
+        });
+        return;
+      }
+
+      const next = file.language ?? language;
+      socket.emit('upload_file', { roomId, language: next, content: file.content });
+      setLanguage(next);
+      toast({ title: 'File uploaded', description: `${file.name} replaced this room's document.`, variant: 'success' });
+    },
+    [roomId, socket, status, language, toast]
+  );
+
   // Re-layout the editor when returning to it on mobile (it was display:none).
   useEffect(() => {
     if (mobileView === 'editor' && editorRef.current) {
@@ -533,6 +567,12 @@ export const RoomEditor = () => {
           </div>
 
           <ShareButton roomId={roomId ?? ''} isPublic={room?.isPublic ?? true} />
+
+          <UploadButton
+            language={language}
+            onUpload={handleUpload}
+            disabled={!ready || !yText}
+          />
 
           <ExportButton
             getContent={getFileContext}

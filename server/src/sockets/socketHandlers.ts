@@ -56,6 +56,12 @@ const HUMAN_EDIT_LOG_THROTTLE_MS = 3_000;
 // close the reconnect ordering race (see yjs_update); the two-step sync
 // recovers anything beyond this, so the bound just guards memory.
 const MAX_QUEUED_UPDATES = 500;
+/**
+ * Cap on an uploaded file, in BYTES (UTF-8 encoded, so a multi-byte character
+ * counts as more than one). Matches the client's gate — the client refuses to
+ * read a file this big, this one refuses to store it regardless of who asks.
+ */
+const MAX_UPLOAD_BYTES = 1024 * 1024;
 
 /**
  * Rooms in the middle of an admin close/delete. A join that races the teardown
@@ -373,21 +379,23 @@ const applySuggestionToDoc = (state: RoomState, changes: AiChange[], origin: unk
 // ────────────────────────────── Edit logging ───────────────────────────────
 
 /**
- * Serialises language changes per room. The handler awaits the database write
- * before broadcasting, so without this two switches in quick succession (JS →
- * Python → TypeScript) can interleave at the await and have the *older* result
- * broadcast last — leaving every collaborator stuck on Python while the room is
- * stored as TypeScript. Chaining keeps "persist then broadcast" atomic per room.
+ * Serialises room-mutating work per room: language changes AND file uploads.
+ * Both handlers await a database write before broadcasting, so without this
+ * two of them in quick succession (JS → Python, or a switch racing an upload)
+ * can interleave at the await and have the *older* result broadcast last —
+ * leaving every collaborator on a different language or document than the
+ * room is actually stored as. Chaining keeps "persist then broadcast" atomic
+ * per room, and makes an upload unable to race a concurrent language switch.
  */
-const languageChangeQueues = new Map<string, Promise<void>>();
+const roomMutationQueues = new Map<string, Promise<void>>();
 
-const enqueueLanguageChange = (roomId: string, work: () => Promise<void>): void => {
-  const previous = languageChangeQueues.get(roomId) ?? Promise.resolve();
+const enqueueRoomMutation = (roomId: string, work: () => Promise<void>): void => {
+  const previous = roomMutationQueues.get(roomId) ?? Promise.resolve();
   const next = previous.then(work, work);
-  languageChangeQueues.set(roomId, next);
+  roomMutationQueues.set(roomId, next);
   // Keep the map from growing without bound once the chain has settled.
   const settle = (): void => {
-    if (languageChangeQueues.get(roomId) === next) languageChangeQueues.delete(roomId);
+    if (roomMutationQueues.get(roomId) === next) roomMutationQueues.delete(roomId);
   };
   void next.then(settle, settle);
 };
@@ -787,7 +795,7 @@ export const registerSocketHandlers = (io: Server): void => {
       // been edited — replace it?". Absent/`keep` means keep the content.
       const wantsReplace = snippet === 'replace';
 
-      enqueueLanguageChange(roomId, async () => {
+      enqueueRoomMutation(roomId, async () => {
         const state = rooms.get(roomId);
         // The room can be evicted while this waits its turn in the queue.
         if (!state) return;
@@ -810,6 +818,90 @@ export const registerSocketHandlers = (io: Server): void => {
         if (snippetReplaced) await persistRoom(roomId, state);
 
         io.to(roomId).emit('language_changed', { roomId, language: next, snippetReplaced });
+      });
+    });
+
+    // ────────────────────────── upload_file ──────────────────────────────
+    // A member replaced the document with a file from their machine. Same
+    // shape as change_language and on the SAME per-room queue, so an upload
+    // can never interleave with a language switch and land the room with one
+    // of the two halves applied. The client has already validated the file;
+    // everything is checked again here because the socket is the boundary.
+    socket.on('upload_file', (payload: unknown) => {
+      const { content, language: requested, roomId: payloadRoomId } = (payload ?? {}) as {
+        content?: unknown;
+        language?: unknown;
+        roomId?: string;
+      };
+
+      const roomId = resolveRoomId(socket, payloadRoomId);
+      if (!roomId) {
+        socket.emit('error', { message: 'Join a room before uploading a file.' });
+        return;
+      }
+      if (!rooms.has(roomId)) {
+        socket.emit('error', { message: 'This room is not live right now.' });
+        return;
+      }
+
+      if (typeof content !== 'string') {
+        socket.emit('error', { message: 'That file could not be read as text.' });
+        return;
+      }
+      // Re-check the size the client already checked: the socket will accept
+      // whatever it is sent, so the cap has to exist on both sides.
+      if (Buffer.byteLength(content, 'utf8') > MAX_UPLOAD_BYTES) {
+        socket.emit('error', { message: 'That file is too large — uploads are capped at 1 MB.' });
+        return;
+      }
+      // `normalizeLanguage` maps anything unknown to the default rather than
+      // rejecting it, so comparing against what it would store is what makes
+      // this a validation: an unrecognised language is refused instead of
+      // silently downgrading the room to JavaScript.
+      const next = normalizeLanguage(requested);
+      if (typeof requested !== 'string' || next !== requested.toLowerCase()) {
+        socket.emit('error', { message: 'Unsupported language for that upload.' });
+        return;
+      }
+
+      enqueueRoomMutation(roomId, async () => {
+        const state = rooms.get(roomId);
+        if (!state) return;
+
+        try {
+          await Room.updateOne({ _id: roomId }, { $set: { language: next } });
+        } catch (err) {
+          console.error(`[socket] Failed to persist language for room ${roomId}:`, err);
+          return;
+        }
+        state.language = next;
+
+        // One transaction, same shape as the starter rewrite: clear, insert,
+        // tagged so anything observing the origin can tell this apart from a
+        // typed edit. Deleting and inserting together means collaborators
+        // receive a single coherent replacement rather than a delete and an
+        // insert they could interleave with their own typing.
+        state.doc.transact(() => {
+          const target = state.doc.getText('content');
+          target.delete(0, target.length);
+          target.insert(0, content);
+        }, 'file_upload');
+
+        // Persist immediately rather than waiting for the 30s snapshot timer:
+        // this is real content, and a restart before the timer fired would put
+        // the old document back under the newly stored language.
+        await persistRoom(roomId, state);
+
+        // Everyone, the uploader included: this edit has no sender socket to
+        // exclude, because the server made it (see replaceStarterIfAsked).
+        const update = Y.encodeStateAsUpdate(state.doc);
+        io.to(roomId).emit('yjs_update', { update: toBase64(update), roomId });
+
+        logEdit(roomId, user.id, 'human_edit', 'File uploaded — replaced document');
+
+        // Sent AFTER the bytes so every client's status bar and Monaco mode
+        // flip together with the content it belongs to.
+        io.to(roomId).emit('language_changed', { roomId, language: next, snippetReplaced: false });
       });
     });
 

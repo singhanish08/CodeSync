@@ -3,9 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  // Vercel serves the built assets from the project root, so keep the base
-  // relative so the static build works regardless of deployment path.
-  base: './',
+  // Absolute base: the SPA rewrite serves index.html for nested routes like
+  // /room/:roomId, where a relative base would resolve ./assets to /room/assets.
+  base: '/',
   server: {
     port: 5176,
     strictPort: false,

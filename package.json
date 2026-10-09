@@ -17,6 +17,9 @@
     "typecheck": "npm run typecheck:server && npm run typecheck:client",
     "install:all": "npm install"
   },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
   "author": "",
   "license": "MIT"
 }

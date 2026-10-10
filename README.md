@@ -16,7 +16,7 @@ Built as a TypeScript monorepo: `client/` (React + Vite) and `server/` (Express 
 - **Server-authoritative language switching** — the language dropdown sends `change_language`; the server persists `Room.language` and decides whether the starter snippet is rewritten, then broadcasts `language_changed` so every client retargets Monaco together (see "How real-time sync works").
 - **Upload a file into the room** — toolbar → **Upload**: text files up to **1 MB** (the client refuses binary files by magic bytes and control characters; the server re-checks size, type and language), a confirm modal, then the shared document is replaced for everyone as a single transaction. The file's extension sets the room's language; an unrecognised extension keeps the current one.
 - **Export the buffer** — toolbar → **Export** downloads the current document with the extension for the active language.
-- **Custom JWT auth** — 15-minute access tokens (kept in memory), httpOnly refresh cookies, `tokenVersion` invalidation on password reset, Gmail-based password reset with SHA-256-hashed tokens and anti-enumeration responses.
+- **Custom JWT auth** — 15-minute access tokens (kept in memory), httpOnly refresh cookies, `tokenVersion` invalidation on password reset, Brevo (HTTP API) password reset with SHA-256-hashed tokens and anti-enumeration responses.
 - **Remember me & visible failures** — the login checkbox opts into a 30-day refresh cookie (unchecked → a browser-session cookie), and login/signup failures surface as a toast carrying the server's message instead of a silent no-op.
 - **Proactive token refresh** — the client refreshes ~1 minute before expiry and reconnects the socket with the new token, so an active session is never silently dropped. A 401 also triggers a single silent retry.
 - **Three themes** — Light, Dark, and a warm low-blue-light **Eye Shield** mode, applied consistently across the app *and* Monaco via three custom registered editor themes. Persisted in `localStorage`.
@@ -39,7 +39,7 @@ Built as a TypeScript monorepo: `client/` (React + Vite) and `server/` (Express 
 | Database     | MongoDB + Mongoose (Atlas)                                                |
 | AI           | Groq SDK, model `openai/gpt-oss-120b`                                     |
 | Parsing      | tree-sitter (+ javascript / typescript / python / c / cpp / java / go / rust / ruby / json / html / css / bash grammars) |
-| Auth         | jsonwebtoken + bcrypt, nodemailer (Gmail SMTP) for resets                 |
+| Auth         | jsonwebtoken + bcrypt, Brevo HTTP API for resets                          |
 
 ---
 
@@ -84,18 +84,18 @@ CodeSync/
 - **Node.js 18+** and npm
 - A **MongoDB** database (local or Atlas — see deployment)
 - A **Groq API key** — free at <https://console.groq.com/keys>
-- A **Gmail App Password** for password-reset emails (see below)
+- A **Brevo API key** for password-reset emails (see below)
 
-### Getting a Gmail App Password
+### Getting a Brevo API key
 
-Password reset emails use Gmail SMTP. Gmail does not allow your account password for this; you need an **App Password**:
+Password reset emails are sent through **Brevo's transactional HTTP API** rather than SMTP. (Gmail SMTP was the original transport; Render blocks outbound SMTP, so those sends hung until they died with `ETIMEDOUT … command: 'CONN'`.) Brevo is called over plain HTTPS, and Node 20's built-in `fetch` means there is no extra dependency:
 
-1. Enable **2-Step Verification** on your Google account (<https://myaccount.google.com/security>).
-2. Open **App passwords** (<https://myaccount.google.com/apppasswords>).
-3. Create a new app password (name it e.g. "CodeSync").
-4. Copy the 16-character password — this goes in `GMAIL_APP_PASSWORD`. Your Gmail address goes in `GMAIL_USER`.
+1. Create a free account at <https://www.brevo.com>.
+2. Open **Transactional → SMTP & API** and generate an **API key** — this goes in `BREVO_API_KEY`.
+3. Under **Senders**, add and verify an address your account may send from — that address goes in `BREVO_SENDER_EMAIL`.
+4. Set both wherever the server runs: local `server/.env`, and Render's environment variables.
 
-> The app still runs without these two variables — the forgot-password endpoint logs a server-side warning and returns the same generic success message. You just won't receive the email.
+> The app still runs without these two variables — the forgot-password endpoint logs a server-side warning and returns the same generic success message. You just won't receive the email. Requests are also aborted after 10 seconds so a stuck call can never hang the endpoint.
 
 ### Getting a Groq API key
 
@@ -141,8 +141,8 @@ Edit `server/.env`:
 | `JWT_ACCESS_SECRET`  | yes      | Any long random string. Generate with `openssl rand -hex 32` |
 | `JWT_REFRESH_SECRET` | yes      | A different long random string                            |
 | `GROQ_API_KEY`       | yes*     | Groq API key (*the app boots without it but AI calls fail) |
-| `GMAIL_USER`         | no       | Gmail address for reset emails                            |
-| `GMAIL_APP_PASSWORD` | no       | Gmail App Password (see above)                            |
+| `BREVO_API_KEY`      | no       | Brevo API key for reset emails (see above)               |
+| `BREVO_SENDER_EMAIL` | no       | Verified Brevo sender address                            |
 | `FRONTEND_URL`       | no       | Client origin, defaults to `http://localhost:5176`        |
 | `PORT`               | no       | Defaults to `5175`                                        |
 | `NODE_ENV`           | no       | `development` locally                                     |
@@ -284,7 +284,7 @@ That's the whole surface area — no component needs to change, because nothing 
    - **Build Command:** `npm install && npm run build`
    - **Start Command:** `npm run start`
    - **Instance Type:** Free or Starter (a free tier will sleep after inactivity — the frontend shows "Waking up the server…" while it cold-starts)
-4. Add environment variables (from `server/.env.example`) — set `NODE_ENV=production`, `FRONTEND_URL` to your Vercel URL, plus your Atlas `MONGODB_URI`, JWT secrets, `GROQ_API_KEY`, and Gmail credentials.
+4. Add environment variables (from `server/.env.example`) — set `NODE_ENV=production`, `FRONTEND_URL` to your Vercel URL, plus your Atlas `MONGODB_URI`, JWT secrets, `GROQ_API_KEY`, and Brevo credentials (`BREVO_API_KEY`, `BREVO_SENDER_EMAIL`).
 5. Deploy and note the service URL (e.g. `https://codesync-api.onrender.com`).
 
 ### C. Vercel (frontend — static Vite build)
